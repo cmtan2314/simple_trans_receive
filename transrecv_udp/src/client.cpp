@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
+#include <control_msgs/msg/joint_trajectory_controller_state.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
 #include "transrecv_udp/periodic_thread.hpp"
@@ -31,6 +32,12 @@ constexpr const char * kLeftArmCommandTopic =
   "/left_joint_trajectory_controller/joint_trajectory";
 constexpr const char * kRightArmCommandTopic =
   "/right_joint_trajectory_controller/joint_trajectory";
+
+// Controller state republished locally. Nothing feeds these yet.
+constexpr const char * kLeftControllerStateTopic =
+  "/left_joint_trajectory_controller/controller_state";
+constexpr const char * kRightControllerStateTopic =
+  "/right_joint_trajectory_controller/controller_state";
 
 constexpr std::size_t kStateQueueDepth = 10;
 
@@ -126,9 +133,17 @@ public:
         on_joint_trajectory(ArmSide::kRight, msg);
       });
 
+    left_state_pub_ = create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
+      kLeftControllerStateTopic, qos);
+    right_state_pub_ = create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
+      kRightControllerStateTopic, qos);
+
     RCLCPP_INFO(
       get_logger(), "forwarding '%s' and '%s' to %s",
       kLeftArmCommandTopic, kRightArmCommandTopic, server_text_.c_str());
+    RCLCPP_INFO(
+      get_logger(), "registered publishers for '%s' and '%s' (depth %zu, reliable)",
+      kLeftControllerStateTopic, kRightControllerStateTopic, kStateQueueDepth);
     RCLCPP_INFO(
       get_logger(), "pinging %s every %ldms, link is down after %ldms without an answer",
       server_text_.c_str(), static_cast<long>(kPingPeriod.count()),
@@ -284,10 +299,17 @@ private:
 
   void handle_datagram(const unsigned char * data, std::size_t length)
   {
+    // Classify by length first: the two packet types have different fixed
+    // sizes, so nothing has to be decoded to tell them apart.
+    if (length == sizeof(transrecv_udp::JointPacket)) {
+      handle_joint_datagram(data, length);
+      return;
+    }
+
     if (length != sizeof(transrecv_udp::ControlPacket)) {    // Rule 3: size guard
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), kLogThrottleMs,
-        "ignoring a %zu byte datagram, the client only expects control packets", length);
+        "ignoring a %zu byte datagram, no packet type has that size", length);
       packets_dropped_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
@@ -418,6 +440,60 @@ private:
     return true;
   }
 
+  // --- controller state ------------------------------------------------------
+
+  /// Decodes controller state pushed by the server and republishes it locally.
+  /// Runs on the receive thread.
+  void handle_joint_datagram(const unsigned char * data, std::size_t length)
+  {
+    transrecv_udp::DecodedPacket decoded;
+    std::string reason;
+    if (!transrecv_udp::decode_packet(data, length, decoded, reason)) {
+      RCLCPP_WARN_THROTTLE(                                  // Rule 2: reject, don't guess
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "malformed joint datagram dropped: %s", reason.c_str());
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    states_received_.fetch_add(1, std::memory_order_relaxed);
+    publish_controller_state(decoded.arm, decoded.positions);
+  }
+
+  /// Publishes one arm's controller state locally.
+  void publish_controller_state(ArmSide side, const std::vector<double> & positions)
+  {
+    if (positions.size() != kNumArmJoints) {                 // Rule 3: size guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] %zu positions, expected %zu, not publishing state",
+        transrecv_udp::to_string(side), positions.size(), kNumArmJoints);
+      return;
+    }
+
+    const auto & publisher =
+      side == ArmSide::kLeft ? left_state_pub_ : right_state_pub_;
+    if (publisher == nullptr) {                              // Rule 3: null guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] state publisher is null, not publishing",
+        transrecv_udp::to_string(side));
+      return;
+    }
+
+    control_msgs::msg::JointTrajectoryControllerState message;
+    message.header.stamp = now();
+    message.joint_names = transrecv_udp::arm_joint_names(side);
+    message.feedback.positions = positions;
+    publisher->publish(message);
+
+    states_published_.fetch_add(1, std::memory_order_relaxed);
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kLogThrottleMs,
+      "[%s] state published: [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
+      transrecv_udp::to_string(side), positions[0], positions[1], positions[2],
+      positions[3], positions[4], positions[5], positions[6]);
+  }
+
   // --- health thread ---------------------------------------------------------
 
   /// One watchdog pass, on its own thread so a stalled callback is still
@@ -487,8 +563,15 @@ private:
   std::atomic<std::chrono::steady_clock::time_point> last_send_time_{
     std::chrono::steady_clock::time_point{}};
 
+  std::atomic<std::uint64_t> states_received_{0};
+  std::atomic<std::uint64_t> states_published_{0};
+
   rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr left_sub_;
   rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr right_sub_;
+  rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
+    left_state_pub_;
+  rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
+    right_state_pub_;
 
   std::thread receive_thread_;
   std::atomic<bool> receive_running_{false};
@@ -509,10 +592,12 @@ int main(int argc, char ** argv)
   // rclcpp::init strips ROS args; whatever is left is ours.
   const std::vector<std::string> args = rclcpp::remove_ros_arguments(argc, argv);
 
-  constexpr std::size_t kExpectedArgCount = 3;  // program, ip, port
+  // program, server ip, server port, bind port
+  constexpr std::size_t kExpectedArgCount = 4;
   if (args.size() != kExpectedArgCount) {                    // Rule 3 + Rule 2
     RCLCPP_ERROR(
-      logger, "usage: %s <server_ip> <server_port>   (got %zu arguments)",
+      logger,
+      "usage: %s <server_ip> <server_port> <bind_port>   (got %zu arguments)",
       args.empty() ? "client" : args[0].c_str(), args.size() - 1);
     rclcpp::shutdown();
     return 1;
@@ -522,20 +607,36 @@ int main(int argc, char ** argv)
   const std::optional<std::uint16_t> server_port = parse_port(args[2]);
   if (!server_port.has_value()) {                            // Rule 3: range guard
     RCLCPP_ERROR(
-      logger, "invalid port '%s' (expected %u..%u)",
+      logger, "invalid server port '%s' (expected %u..%u)",
       args[2].c_str(), kMinUserPort, UINT16_MAX);
     rclcpp::shutdown();
     return 1;
   }
 
-  // Open here, before the node exists: a bad address fails fast and loud. The
-  // server does not have to be up yet -- the connection thread keeps pinging.
-  sockaddr_in server{};
-  transrecv_udp::UdpSocket client_socket;
-  if (!client_socket.open_to(server_ip, server_port.value(), server, logger)) {
+  const std::optional<std::uint16_t> bind_port = parse_port(args[3]);
+  if (!bind_port.has_value()) {                              // Rule 3: range guard
     RCLCPP_ERROR(
-      logger, "cannot open a socket for %s:%u, exiting",
-      server_ip.c_str(), server_port.value());
+      logger, "invalid bind port '%s' (expected %u..%u)",
+      args[3].c_str(), kMinUserPort, UINT16_MAX);
+    rclcpp::shutdown();
+    return 1;
+  }
+
+  // Resolve before binding: a typo in the address should fail before anything
+  // holds a port.
+  sockaddr_in server{};
+  if (!transrecv_udp::resolve_ipv4(server_ip, server_port.value(), server, logger)) {
+    rclcpp::shutdown();
+    return 1;
+  }
+
+  // Bind a known local port on INADDR_ANY: the server was told this port up
+  // front, so it has to be the one we actually listen on, but which interface
+  // the traffic arrives on is not ours to decide. The server does not have to
+  // be up yet -- the connection thread keeps pinging.
+  transrecv_udp::UdpSocket client_socket;
+  if (!client_socket.bind_any(bind_port.value(), logger)) {
+    RCLCPP_ERROR(logger, "cannot bind port %u, exiting", bind_port.value());
     rclcpp::shutdown();
     return 1;
   }

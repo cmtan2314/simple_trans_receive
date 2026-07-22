@@ -1,0 +1,20 @@
+# colcon build artifacts, at the workspace root and inside any package
+build/
+install/
+log/
+
+# ament / colcon leftovers
+.colcon_install_layout
+COLCON_IGNORE
+
+# editor and OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# compiled objects
+*.o
+*.so
+*.a

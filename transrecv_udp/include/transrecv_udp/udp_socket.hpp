@@ -18,6 +18,26 @@
 namespace transrecv_udp
 {
 
+/// Fills `out` with an IPv4 address, logging and failing on a malformed one so
+/// a typo never turns into datagrams quietly going nowhere.
+inline bool resolve_ipv4(
+  const std::string & address, std::uint16_t port, sockaddr_in & out,
+  const rclcpp::Logger & logger)
+{
+  out = sockaddr_in{};
+  out.sin_family = AF_INET;
+  out.sin_port = htons(port);
+
+  const int converted = inet_pton(AF_INET, address.c_str(), &out.sin_addr);
+  if (converted != 1) {                             // Rule 3: address guard
+    RCLCPP_ERROR(
+      logger, "'%s' is not a valid IPv4 address (inet_pton returned %d)",
+      address.c_str(), converted);
+    return false;
+  }
+  return true;
+}
+
 /// Owns an IPv4 UDP socket and closes it exactly once.
 ///
 /// Both ends create theirs in main(), so a bad port or address fails

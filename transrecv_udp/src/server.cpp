@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
+#include <control_msgs/msg/joint_trajectory_controller_state.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
 #include "transrecv_udp/periodic_thread.hpp"
@@ -34,8 +35,15 @@ constexpr const char * kLeftArmTrajectoryTopic =
 constexpr const char * kRightArmTrajectoryTopic =
   "/right_joint_trajectory_controller/joint_trajectory";
 
+// Measured state from the local controllers, forwarded to the client.
+constexpr const char * kLeftControllerStateTopic =
+  "/left_joint_trajectory_controller/controller_state";
+constexpr const char * kRightControllerStateTopic =
+  "/right_joint_trajectory_controller/controller_state";
+
 // Matches the publisher side of the dora bridge (dora_ros2_bridge/main.py).
 constexpr std::size_t kTrajectoryQueueDepth = 10;
+constexpr std::size_t kStateQueueDepth = 10;
 
 // Both arms, indexed by ArmSide.
 constexpr std::size_t kNumArms = 2;
@@ -75,13 +83,24 @@ constexpr double kMinRateWindowSeconds = 1e-9;
 // has to be chosen. Nothing about the client is configured: joint data is
 // one-way (client -> server), and the only reply is a pong sent straight back
 // to whoever pinged.
-constexpr std::uint16_t kDefaultServerPort = 9000;
 constexpr std::uint16_t kMinUserPort = 1024;
 
 // The receive thread parks in a blocking recv(). This timeout is only how long
 // it can go without noticing a stop request, so it trades shutdown latency
 // against wakeups: 200 ms is imperceptible on exit and idles at 5 wakeups/s.
 constexpr std::chrono::milliseconds kReceiveTimeout{200};
+
+// --- Send thread ------------------------------------------------------------
+// The controller state subscribed to above is pushed to the client on its own
+// thread, on its own clock: the ROS callbacks that supply it and the socket
+// that consumes it should not be able to stall each other.
+//
+// ASSUMPTION: 100 Hz. Nothing in the requirement fixed a rate, so this is a
+// starting value, not a derived one -- change kStateSendPeriod if the far end
+// wants something else. Sending on a clock rather than per callback also means
+// the wire rate stays put when the controller rate wobbles; the cost is that a
+// pose can be repeated, or one skipped, when the two clocks disagree.
+constexpr std::chrono::milliseconds kStateSendPeriod{10};
 
 // --- Health monitor ---------------------------------------------------------
 constexpr std::chrono::milliseconds kHealthCheckPeriod{5000};
@@ -126,10 +145,15 @@ class TrajectoryServer : public rclcpp::Node
 {
 public:
   /// `socket_fd` must outlive this node; ownership stays with the caller.
-  TrajectoryServer(int socket_fd, std::uint16_t port)
+  /// `client` is where the send thread pushes controller state.
+  TrajectoryServer(
+    int socket_fd, std::uint16_t port, const sockaddr_in & client,
+    const std::string & client_text)
   : rclcpp::Node("transrecv_udp_server"),
     socket_fd_(socket_fd),
-    port_(port)
+    port_(port),
+    client_(client),
+    client_text_(client_text)
   {
     if (socket_fd_ < 0) {                                    // Rule 3: precondition
       RCLCPP_ERROR(get_logger(), "constructed with an invalid socket fd %d", socket_fd_);
@@ -142,9 +166,27 @@ public:
     publishers_[arm_index(ArmSide::kRight)] =
       create_publisher<trajectory_msgs::msg::JointTrajectory>(kRightArmTrajectoryTopic, qos);
 
+    const rclcpp::QoS state_qos = rclcpp::QoS(kStateQueueDepth).reliable();
+    left_state_sub_ = create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
+      kLeftControllerStateTopic, state_qos,
+      [this](control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr msg) {
+        on_controller_state(ArmSide::kLeft, msg);
+      });
+    right_state_sub_ = create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
+      kRightControllerStateTopic, state_qos,
+      [this](control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr msg) {
+        on_controller_state(ArmSide::kRight, msg);
+      });
+
     RCLCPP_INFO(
       get_logger(), "publishing on '%s' and '%s' (depth %zu, reliable)",
       kLeftArmTrajectoryTopic, kRightArmTrajectoryTopic, kTrajectoryQueueDepth);
+    RCLCPP_INFO(
+      get_logger(), "subscribed to '%s' and '%s' (depth %zu, reliable)",
+      kLeftControllerStateTopic, kRightControllerStateTopic, kStateQueueDepth);
+    RCLCPP_INFO(
+      get_logger(), "pushing controller state to %s every %ldms",
+      client_text_.c_str(), static_cast<long>(kStateSendPeriod.count()));
     RCLCPP_INFO(get_logger(), "waiting for client datagrams on port %u", port_);
   }
 
@@ -166,6 +208,7 @@ public:
     receive_thread_ = std::thread([this]() { run_receive_loop(); });
     RCLCPP_INFO(get_logger(), "receive thread started");
 
+    send_thread_.start();
     health_thread_.start();
   }
 
@@ -173,6 +216,7 @@ public:
   void stop()
   {
     health_thread_.stop();
+    send_thread_.stop();
 
     if (!receive_thread_.joinable()) {
       return;
@@ -410,6 +454,120 @@ private:
     ++window_published_;
   }
 
+  // --- controller state ------------------------------------------------------
+
+  /// Runs on the ROS executor, not the receive thread. Only stores the pose;
+  /// the send thread is what puts it on the wire, so a slow socket cannot back
+  /// up into the subscription.
+  void on_controller_state(
+    ArmSide side, control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr msg)
+  {
+    if (msg == nullptr) {                                    // Rule 3: null guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] null controller state, dropping", transrecv_udp::to_string(side));
+      return;
+    }
+
+    const std::vector<double> & feedback = msg->feedback.positions;
+    if (feedback.size() < kNumArmJoints) {                   // Rule 3: size guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] feedback has %zu positions, need %zu, dropping",
+        transrecv_udp::to_string(side), feedback.size(), kNumArmJoints);
+      return;
+    }
+
+    // The controller may expose more than the arm joints; take the first seven,
+    // matching what the bridge reads on this same topic.
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      ArmState & state = arm_states_[arm_index(side)];
+      state.positions.assign(feedback.begin(), feedback.begin() + kNumArmJoints);
+      state.has_data = true;
+    }
+
+    states_received_.fetch_add(1, std::memory_order_relaxed);
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kDataLogThrottleMs,
+      "[%s] controller state: [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
+      transrecv_udp::to_string(side), feedback[0], feedback[1], feedback[2],
+      feedback[3], feedback[4], feedback[5], feedback[6]);
+  }
+
+  // --- send thread -----------------------------------------------------------
+
+  /// One tick: push each arm's newest controller state to the client.
+  ///
+  /// Runs on its own thread so the socket and the ROS callbacks that feed it
+  /// cannot block one another. An arm with no state yet is skipped rather than
+  /// sent as zeros -- a zero pose is a valid-looking command, and inventing one
+  /// is worse than sending nothing.
+  void send_states()
+  {
+    if (socket_fd_ < 0) {                                    // Rule 3: socket sanity
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "send thread: socket is not open, cannot send");
+      return;
+    }
+
+    for (std::size_t index = 0; index < kNumArms; ++index) {
+      const ArmSide side = index == 0 ? ArmSide::kLeft : ArmSide::kRight;
+
+      std::vector<double> positions;
+      {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        const ArmState & state = arm_states_[index];
+        if (!state.has_data) {                               // Rule 2: nothing to send yet
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), kLogThrottleMs,
+            "[%s] no controller state received yet, nothing to send",
+            transrecv_udp::to_string(side));
+          continue;
+        }
+        positions = state.positions;
+      }
+
+      send_state(side, positions);
+    }
+  }
+
+  void send_state(ArmSide side, const std::vector<double> & positions)
+  {
+    if (positions.size() != kNumArmJoints) {                 // Rule 3: size guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] held state has %zu positions, expected %zu, not sending",
+        transrecv_udp::to_string(side), positions.size(), kNumArmJoints);
+      return;
+    }
+
+    const transrecv_udp::JointPacket packet = transrecv_udp::make_packet(side, positions);
+
+    const ssize_t sent = sendto(
+      socket_fd_, &packet, sizeof(packet), 0,
+      reinterpret_cast<const sockaddr *>(&client_), sizeof(client_));
+
+    if (sent < 0) {
+      RCLCPP_WARN_THROTTLE(                                  // Rule 2: log the failure path
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s] sendto(%s) failed: %s", transrecv_udp::to_string(side),
+        client_text_.c_str(), std::strerror(errno));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    if (static_cast<std::size_t>(sent) != sizeof(packet)) {   // Rule 3: short-write guard
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s] short send: %zd of %zu bytes", transrecv_udp::to_string(side), sent,
+        sizeof(packet));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    states_sent_.fetch_add(1, std::memory_order_relaxed);
+  }
+
   // --- health thread ---------------------------------------------------------
 
   /// One watchdog pass. Its own thread on purpose: if the receive thread
@@ -461,8 +619,21 @@ private:
       static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped));
   }
 
+  /// The newest controller state for one arm, waiting to be sent.
+  struct ArmState
+  {
+    std::vector<double> positions;
+    bool has_data = false;
+  };
+
   const int socket_fd_;
   const std::uint16_t port_;
+  const sockaddr_in client_;
+  const std::string client_text_;
+
+  // Written by the ROS executor (state callbacks), read by the send thread.
+  std::mutex state_mutex_;
+  std::array<ArmState, kNumArms> arm_states_;
 
   // Written by the receive thread, read by the health thread.
   std::atomic<std::uint64_t> packets_received_{0};
@@ -479,14 +650,27 @@ private:
   std::uint64_t window_received_ = 0;
   std::uint64_t window_published_ = 0;
 
+  // Written by the executor thread (controller state callbacks).
+  std::atomic<std::uint64_t> states_received_{0};
+  // Written by the send thread.
+  std::atomic<std::uint64_t> states_sent_{0};
+
   std::array<rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr, kNumArms>
   publishers_;
+
+  rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
+    left_state_sub_;
+  rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
+    right_state_sub_;
 
   std::thread receive_thread_;
   std::atomic<bool> receive_running_{false};
 
-  // Declared last on purpose: members are destroyed in reverse order, so this
-  // destructor joins the health thread before the counters it reads go away.
+  // Declared last on purpose: members are destroyed in reverse order, so these
+  // destructors join their threads before the state those threads read
+  // (arm_states_, counters, socket fd) goes away.
+  transrecv_udp::PeriodicThread send_thread_{
+    kStateSendPeriod, get_logger(), [this]() { send_states(); }, "send thread"};
   transrecv_udp::PeriodicThread health_thread_{
     kHealthCheckPeriod, get_logger(), [this]() { check_health(); }, "health thread"};
 };
@@ -499,20 +683,43 @@ int main(int argc, char ** argv)
   // rclcpp::init strips ROS args; whatever is left is ours.
   const std::vector<std::string> args = rclcpp::remove_ros_arguments(argc, argv);
 
-  std::uint16_t port = kDefaultServerPort;
-  if (args.size() > 1) {
-    const std::optional<std::uint16_t> parsed = parse_port(args[1]);
-    if (!parsed.has_value()) {                               // Rule 3 + Rule 2
-      RCLCPP_ERROR(
-        logger, "invalid port '%s' (expected %u..%u)",
-        args[1].c_str(), kMinUserPort, UINT16_MAX);
-      rclcpp::shutdown();
-      return 1;
-    }
-    port = parsed.value();
-  } else {
-    RCLCPP_INFO(logger, "no port given, using default %u", kDefaultServerPort);
+  constexpr std::size_t kExpectedArgCount = 4;  // program, bind port, client ip, client port
+  if (args.size() != kExpectedArgCount) {                    // Rule 3 + Rule 2
+    RCLCPP_ERROR(
+      logger, "usage: %s <bind_port> <client_ip> <client_port>   (got %zu arguments)",
+      args.empty() ? "server" : args[0].c_str(), args.size() - 1);
+    rclcpp::shutdown();
+    return 1;
   }
+
+  const std::optional<std::uint16_t> bind_port = parse_port(args[1]);
+  if (!bind_port.has_value()) {                              // Rule 3: range guard
+    RCLCPP_ERROR(
+      logger, "invalid bind port '%s' (expected %u..%u)",
+      args[1].c_str(), kMinUserPort, UINT16_MAX);
+    rclcpp::shutdown();
+    return 1;
+  }
+  const std::uint16_t port = bind_port.value();
+
+  const std::string client_ip = args[2];
+  const std::optional<std::uint16_t> client_port = parse_port(args[3]);
+  if (!client_port.has_value()) {                            // Rule 3: range guard
+    RCLCPP_ERROR(
+      logger, "invalid client port '%s' (expected %u..%u)",
+      args[3].c_str(), kMinUserPort, UINT16_MAX);
+    rclcpp::shutdown();
+    return 1;
+  }
+
+  // Resolve before binding: a typo in the address should fail before anything
+  // holds a port.
+  sockaddr_in client{};
+  if (!transrecv_udp::resolve_ipv4(client_ip, client_port.value(), client, logger)) {
+    rclcpp::shutdown();
+    return 1;
+  }
+  const std::string client_text = client_ip + ":" + std::to_string(client_port.value());
 
   // Bind here, before the node exists: a port clash fails fast and loud instead
   // of surfacing halfway through node construction.
@@ -533,7 +740,8 @@ int main(int argc, char ** argv)
 
   int exit_code = 0;
   try {
-    auto server = std::make_shared<TrajectoryServer>(server_socket.get(), port);
+    auto server =
+      std::make_shared<TrajectoryServer>(server_socket.get(), port, client, client_text);
     server->start();
     rclcpp::spin(server);
     server->stop();                  // join every thread before the socket closes
