@@ -15,7 +15,7 @@
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
-#include <control_msgs/msg/joint_trajectory_controller_state.hpp>
+#include <trajectory_msgs/msg/joint_trajectory.hpp>
 
 #include "transrecv_udp/periodic_thread.hpp"
 #include "transrecv_udp/protocol.hpp"
@@ -26,15 +26,15 @@ namespace
 using transrecv_udp::ArmSide;
 using transrecv_udp::kNumArmJoints;
 
-// Measured state read back from the local controllers and pushed to the server.
-constexpr const char * kLeftControllerStateTopic =
-  "/left_joint_trajectory_controller/controller_state";
-constexpr const char * kRightControllerStateTopic =
-  "/right_joint_trajectory_controller/controller_state";
+// Joint commands going into the local controllers, mirrored to the server.
+constexpr const char * kLeftArmCommandTopic =
+  "/left_joint_trajectory_controller/joint_trajectory";
+constexpr const char * kRightArmCommandTopic =
+  "/right_joint_trajectory_controller/joint_trajectory";
 
 constexpr std::size_t kStateQueueDepth = 10;
 
-// Controller state arrives at a high rate: throttle per-packet logs.
+// Commands arrive at a high rate: throttle per-packet logs.
 constexpr int kLogThrottleMs = 1000;
 
 // --- Connection thread ------------------------------------------------------
@@ -115,20 +115,20 @@ public:
 
     const rclcpp::QoS qos = rclcpp::QoS(kStateQueueDepth).reliable();
 
-    left_sub_ = create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
-      kLeftControllerStateTopic, qos,
-      [this](control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr msg) {
-        on_controller_state(ArmSide::kLeft, msg);
+    left_sub_ = create_subscription<trajectory_msgs::msg::JointTrajectory>(
+      kLeftArmCommandTopic, qos,
+      [this](trajectory_msgs::msg::JointTrajectory::ConstSharedPtr msg) {
+        on_joint_trajectory(ArmSide::kLeft, msg);
       });
-    right_sub_ = create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
-      kRightControllerStateTopic, qos,
-      [this](control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr msg) {
-        on_controller_state(ArmSide::kRight, msg);
+    right_sub_ = create_subscription<trajectory_msgs::msg::JointTrajectory>(
+      kRightArmCommandTopic, qos,
+      [this](trajectory_msgs::msg::JointTrajectory::ConstSharedPtr msg) {
+        on_joint_trajectory(ArmSide::kRight, msg);
       });
 
     RCLCPP_INFO(
       get_logger(), "forwarding '%s' and '%s' to %s",
-      kLeftControllerStateTopic, kRightControllerStateTopic, server_text_.c_str());
+      kLeftArmCommandTopic, kRightArmCommandTopic, server_text_.c_str());
     RCLCPP_INFO(
       get_logger(), "pinging %s every %ldms, link is down after %ldms without an answer",
       server_text_.c_str(), static_cast<long>(kPingPeriod.count()),
@@ -323,28 +323,37 @@ private:
 
   // --- send path -------------------------------------------------------------
 
-  void on_controller_state(
-    ArmSide side, control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr msg)
+  void on_joint_trajectory(
+    ArmSide side, trajectory_msgs::msg::JointTrajectory::ConstSharedPtr msg)
   {
     if (msg == nullptr) {                                    // Rule 3: null guard
       RCLCPP_ERROR(
-        get_logger(), "[%s] null controller state, dropping", transrecv_udp::to_string(side));
+        get_logger(), "[%s] null trajectory, dropping", transrecv_udp::to_string(side));
       packets_dropped_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
 
-    const std::vector<double> & feedback = msg->feedback.positions;
-    if (feedback.size() < kNumArmJoints) {                   // Rule 3: size guard
+    if (msg->points.empty()) {                               // Rule 3: empty guard
       RCLCPP_ERROR(
-        get_logger(), "[%s] feedback has %zu positions, need %zu, dropping",
-        transrecv_udp::to_string(side), feedback.size(), kNumArmJoints);
+        get_logger(), "[%s] trajectory has no points, dropping", transrecv_udp::to_string(side));
       packets_dropped_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
 
-    // The controller may expose more than the arm joints; take the first seven,
-    // matching what the bridge reads on this same topic.
-    const std::vector<double> positions(feedback.begin(), feedback.begin() + kNumArmJoints);
+    // The bridge publishes one point per message; when there are several, the
+    // last one is the target the arm ends up at, which is what the server wants.
+    const std::vector<double> & commanded = msg->points.back().positions;
+    if (commanded.size() < kNumArmJoints) {                  // Rule 3: size guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] trajectory point has %zu positions, need %zu, dropping",
+        transrecv_udp::to_string(side), commanded.size(), kNumArmJoints);
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    // The message may carry more than the arm joints; take the first seven,
+    // matching what the bridge writes on this same topic.
+    const std::vector<double> positions(commanded.begin(), commanded.begin() + kNumArmJoints);
 
     if (!send_packet(side, positions)) {
       return;
@@ -478,8 +487,8 @@ private:
   std::atomic<std::chrono::steady_clock::time_point> last_send_time_{
     std::chrono::steady_clock::time_point{}};
 
-  rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr left_sub_;
-  rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr right_sub_;
+  rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr left_sub_;
+  rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr right_sub_;
 
   std::thread receive_thread_;
   std::atomic<bool> receive_running_{false};
