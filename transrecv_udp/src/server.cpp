@@ -17,6 +17,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <control_msgs/msg/joint_trajectory_controller_state.hpp>
+#include <sensor_msgs/msg/joy.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
 #include "transrecv_udp/periodic_thread.hpp"
@@ -43,7 +44,11 @@ constexpr const char * kRightControllerStateTopic =
 
 // Matches the publisher side of the dora bridge (dora_ros2_bridge/main.py).
 constexpr std::size_t kTrajectoryQueueDepth = 10;
+// VR face buttons received from the client and republished here.
+constexpr const char * kVrButtonsTopic = "/vr_buttons";
+
 constexpr std::size_t kStateQueueDepth = 10;
+constexpr std::size_t kButtonQueueDepth = 10;
 
 // Both arms, indexed by ArmSide.
 constexpr std::size_t kNumArms = 2;
@@ -166,6 +171,9 @@ public:
     publishers_[arm_index(ArmSide::kRight)] =
       create_publisher<trajectory_msgs::msg::JointTrajectory>(kRightArmTrajectoryTopic, qos);
 
+    buttons_pub_ = create_publisher<sensor_msgs::msg::Joy>(
+      kVrButtonsTopic, rclcpp::QoS(kButtonQueueDepth).reliable());
+
     const rclcpp::QoS state_qos = rclcpp::QoS(kStateQueueDepth).reliable();
     left_state_sub_ = create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
       kLeftControllerStateTopic, state_qos,
@@ -282,6 +290,11 @@ private:
       return;
     }
 
+    if (length == sizeof(transrecv_udp::ButtonPacket)) {
+      handle_buttons(data, length);
+      return;
+    }
+
     transrecv_udp::DecodedPacket decoded;
     std::string reason;
     if (!transrecv_udp::decode_packet(data, length, decoded, reason)) {
@@ -364,6 +377,60 @@ private:
     window_started_at_ = now;
     window_received_ = 0;
     window_published_ = 0;
+  }
+
+  /// Republishes VR button state received from the client.
+  ///
+  /// The client only sends on change, so every datagram that lands here is a
+  /// press or a release. That also means this topic goes quiet between events
+  /// rather than ticking -- a subscriber must latch what it last saw instead of
+  /// expecting a steady stream.
+  void handle_buttons(const unsigned char * data, std::size_t length)
+  {
+    std::vector<std::uint8_t> buttons;
+    std::string reason;
+    if (!transrecv_udp::decode_button_packet(data, length, buttons, reason)) {
+      RCLCPP_WARN_THROTTLE(                                  // Rule 2: reject, don't guess
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "malformed button datagram dropped: %s", reason.c_str());
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    if (buttons.empty()) {                                   // Rule 3: size guard
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "button datagram carried no buttons, dropping");
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    if (buttons_pub_ == nullptr) {                           // Rule 3: null guard
+      RCLCPP_ERROR(get_logger(), "button publisher is null, dropping");
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    sensor_msgs::msg::Joy message;
+    message.header.stamp = now();
+    // axes stays empty: only the button flags travel on this path.
+    message.buttons.reserve(buttons.size());
+    for (const std::uint8_t value : buttons) {
+      message.buttons.push_back(static_cast<std::int32_t>(value));
+    }
+    buttons_pub_->publish(message);
+
+    buttons_published_.fetch_add(1, std::memory_order_relaxed);
+
+    // Not throttled: the client already limits this to one per press/release.
+    std::string text = "[";
+    for (std::size_t i = 0; i < buttons.size(); ++i) {
+      text += buttons[i] != 0 ? '1' : '0';
+      if (i + 1 < buttons.size()) {
+        text += ' ';
+      }
+    }
+    RCLCPP_INFO(get_logger(), "buttons published: %s]", text.c_str());
   }
 
   /// Answers a client's liveness ping. This reply is the only thing the server
@@ -654,9 +721,13 @@ private:
   std::atomic<std::uint64_t> states_received_{0};
   // Written by the send thread.
   std::atomic<std::uint64_t> states_sent_{0};
+  // Written by the receive thread.
+  std::atomic<std::uint64_t> buttons_published_{0};
 
   std::array<rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr, kNumArms>
   publishers_;
+
+  rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr buttons_pub_;
 
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
     left_state_sub_;

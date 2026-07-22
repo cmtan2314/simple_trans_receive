@@ -26,9 +26,10 @@ namespace transrecv_udp
 /// routinely filtered, so "no error yet" is not evidence anybody is listening.
 /// An answer from the far end is.
 ///
-/// The two packet types have different fixed sizes, so a datagram is classified
-/// by length before anything is decoded, and a short or oversized one is
-/// rejected on size alone.
+/// Every packet type has a different fixed size, so a datagram is classified by
+/// length before anything is decoded, and a wrong-sized one is rejected on size
+/// alone: ControlPacket 8, ButtonPacket 12, JointPacket 64. The static_asserts
+/// below enforce that they stay distinct.
 
 // Each arm is a 7-DOF OpenArm. Single source of truth for every buffer size.
 constexpr std::size_t kNumArmJoints = 7;
@@ -149,6 +150,85 @@ inline bool decode_control_packet(
   }
 
   out = static_cast<ControlType>(type);
+  return true;
+}
+
+// --- VR buttons -------------------------------------------------------------
+// Room for the four face buttons the VR receiver knows about (a, b, x, y),
+// even though only a and b are wired up today -- a fixed-size packet cannot be
+// grown later without breaking both ends, so the space is reserved up front.
+constexpr std::size_t kMaxButtons = 4;
+
+/// Button state, sent only when it changes.
+///
+/// `count` says how many entries of `buttons` are meaningful; the rest are
+/// zero. Each entry is 0 or 1, matching sensor_msgs/Joy's `buttons` array
+/// (which is int32, but a button is a flag, so one byte carries it).
+#pragma pack(push, 1)
+struct ButtonPacket
+{
+  std::uint32_t magic;
+  std::uint32_t count;
+  std::uint8_t buttons[kMaxButtons];
+};
+#pragma pack(pop)
+
+constexpr std::size_t kButtonPacketBytes =
+  sizeof(std::uint32_t) * 2 + sizeof(std::uint8_t) * kMaxButtons;
+static_assert(
+  sizeof(ButtonPacket) == kButtonPacketBytes,
+  "ButtonPacket must be tightly packed for the wire format");
+static_assert(
+  sizeof(ButtonPacket) != sizeof(JointPacket) &&
+  sizeof(ButtonPacket) != sizeof(ControlPacket),
+  "every packet type must have a distinct size, that is how they are told apart");
+
+/// Packs button flags. Anything past kMaxButtons is dropped -- the caller
+/// checks and logs that before calling.
+inline ButtonPacket make_button_packet(const std::vector<std::uint8_t> & buttons)
+{
+  ButtonPacket packet{};
+  packet.magic = htonl(kPacketMagic);
+
+  const std::size_t count = buttons.size() < kMaxButtons ? buttons.size() : kMaxButtons;
+  packet.count = htonl(static_cast<std::uint32_t>(count));
+  for (std::size_t i = 0; i < count; ++i) {
+    // Normalise to 0/1 so a stray value can never reach the far end as-is.
+    packet.buttons[i] = buttons[i] != 0 ? 1 : 0;
+  }
+  return packet;
+}
+
+/// Validates and decodes a button datagram. Returns false (with `reason` for
+/// the caller to log) on wrong size, bad magic or an impossible count.
+inline bool decode_button_packet(
+  const void * data, std::size_t length, std::vector<std::uint8_t> & out, std::string & reason)
+{
+  if (data == nullptr) {                            // Rule 3: null guard
+    reason = "null buffer";
+    return false;
+  }
+
+  if (length != sizeof(ButtonPacket)) {             // Rule 3: size guard
+    reason = "size " + std::to_string(length) + " != " + std::to_string(sizeof(ButtonPacket));
+    return false;
+  }
+
+  ButtonPacket packet{};
+  std::memcpy(&packet, data, sizeof(packet));
+
+  if (ntohl(packet.magic) != kPacketMagic) {        // Rule 3: not ours
+    reason = "bad magic";
+    return false;
+  }
+
+  const std::uint32_t count = ntohl(packet.count);
+  if (count > kMaxButtons) {                        // Rule 3: range guard
+    reason = "count " + std::to_string(count) + " > " + std::to_string(kMaxButtons);
+    return false;
+  }
+
+  out.assign(packet.buttons, packet.buttons + count);
   return true;
 }
 

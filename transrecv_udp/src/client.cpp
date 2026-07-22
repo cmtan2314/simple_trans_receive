@@ -2,6 +2,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -16,6 +17,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <control_msgs/msg/joint_trajectory_controller_state.hpp>
+#include <sensor_msgs/msg/joy.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
 #include "transrecv_udp/periodic_thread.hpp"
@@ -39,7 +41,15 @@ constexpr const char * kLeftControllerStateTopic =
 constexpr const char * kRightControllerStateTopic =
   "/right_joint_trajectory_controller/controller_state";
 
+// VR face buttons, mirrored to the server. Only the `buttons` array is used;
+// `axes` is left alone because the joysticks travel on their own path.
+constexpr const char * kVrButtonsTopic = "/vr_buttons";
+
 constexpr std::size_t kStateQueueDepth = 10;
+
+// Buttons are events, not a stream: a small depth is plenty, and the reliable
+// QoS is what stops a press from being dropped locally before we ever see it.
+constexpr std::size_t kButtonQueueDepth = 10;
 
 // Commands arrive at a high rate: throttle per-packet logs.
 constexpr int kLogThrottleMs = 1000;
@@ -133,6 +143,10 @@ public:
         on_joint_trajectory(ArmSide::kRight, msg);
       });
 
+    buttons_sub_ = create_subscription<sensor_msgs::msg::Joy>(
+      kVrButtonsTopic, rclcpp::QoS(kButtonQueueDepth).reliable(),
+      [this](sensor_msgs::msg::Joy::ConstSharedPtr msg) { on_vr_buttons(msg); });
+
     left_state_pub_ = create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
       kLeftControllerStateTopic, qos);
     right_state_pub_ = create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
@@ -144,6 +158,9 @@ public:
     RCLCPP_INFO(
       get_logger(), "registered publishers for '%s' and '%s' (depth %zu, reliable)",
       kLeftControllerStateTopic, kRightControllerStateTopic, kStateQueueDepth);
+    RCLCPP_INFO(
+      get_logger(), "mirroring '%s' to %s, on change only",
+      kVrButtonsTopic, server_text_.c_str());
     RCLCPP_INFO(
       get_logger(), "pinging %s every %ldms, link is down after %ldms without an answer",
       server_text_.c_str(), static_cast<long>(kPingPeriod.count()),
@@ -440,6 +457,123 @@ private:
     return true;
   }
 
+  // --- VR buttons ------------------------------------------------------------
+
+  /// Mirrors button state to the server, but only when it actually changed.
+  ///
+  /// /vr_buttons republishes at its source's rate whether or not anything was
+  /// pressed, and a button is a step function: resending an unchanged value
+  /// says nothing new. Comparing against the last sent value turns a steady
+  /// stream into one datagram per press and one per release.
+  void on_vr_buttons(sensor_msgs::msg::Joy::ConstSharedPtr msg)
+  {
+    if (msg == nullptr) {                                    // Rule 3: null guard
+      RCLCPP_ERROR(get_logger(), "null Joy message on '%s', dropping", kVrButtonsTopic);
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    if (msg->buttons.empty()) {                              // Rule 3: size guard
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "Joy message on '%s' has no buttons, dropping", kVrButtonsTopic);
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    if (msg->buttons.size() > transrecv_udp::kMaxButtons) {  // Rule 2: truncating, say so
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "Joy message has %zu buttons, only the first %zu fit in a packet",
+        msg->buttons.size(), transrecv_udp::kMaxButtons);
+    }
+
+    // Joy carries int32; a button is a flag, so normalise to 0/1 here and the
+    // comparison below is then a plain byte compare.
+    const std::size_t count =
+      std::min(msg->buttons.size(), transrecv_udp::kMaxButtons);
+    std::vector<std::uint8_t> buttons(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      buttons[i] = msg->buttons[i] != 0 ? 1 : 0;
+    }
+
+    if (buttons == last_buttons_sent_) {                     // unchanged: stay silent
+      RCLCPP_DEBUG(get_logger(), "button state unchanged, not sending");
+      return;
+    }
+
+    if (!send_button_packet(buttons)) {
+      // Not recording it as sent: the next message must retry, or a press lost
+      // to a down link would never be resent (nothing else repeats it).
+      return;
+    }
+
+    last_buttons_sent_ = buttons;
+    buttons_sent_.fetch_add(1, std::memory_order_relaxed);
+
+    // Not throttled: one line per press or release is exactly the rate the
+    // change detection above already limits this to.
+    RCLCPP_INFO(
+      get_logger(), "buttons changed, sent: %s", describe_buttons(buttons).c_str());
+  }
+
+  bool send_button_packet(const std::vector<std::uint8_t> & buttons)
+  {
+    if (!socket_.valid()) {                                  // Rule 3: use-before-init
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs, "socket not open, cannot send buttons");
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    if (!connected_.load(std::memory_order_relaxed)) {       // Rule 2: waiting on the retry
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "not connected to %s, dropping button change", server_text_.c_str());
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    const transrecv_udp::ButtonPacket packet = transrecv_udp::make_button_packet(buttons);
+    const ssize_t sent = send(socket_.get(), &packet, sizeof(packet), 0);
+
+    if (sent < 0) {
+      if (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EHOSTUNREACH) {
+        mark_disconnected(std::strerror(errno));             // hand it to the retry thread
+      } else {
+        RCLCPP_WARN_THROTTLE(                                // Rule 2: log the failure path
+          get_logger(), *get_clock(), kLogThrottleMs,
+          "send(buttons) failed: %s", std::strerror(errno));
+      }
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    if (static_cast<std::size_t>(sent) != sizeof(packet)) {   // Rule 3: short-write guard
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "short button send: %zd of %zu bytes", sent, sizeof(packet));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    packets_sent_.fetch_add(1, std::memory_order_relaxed);
+    last_send_time_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+    return true;
+  }
+
+  static std::string describe_buttons(const std::vector<std::uint8_t> & buttons)
+  {
+    std::string text = "[";
+    for (std::size_t i = 0; i < buttons.size(); ++i) {
+      text += buttons[i] != 0 ? '1' : '0';
+      if (i + 1 < buttons.size()) {
+        text += ' ';
+      }
+    }
+    return text + "]";
+  }
+
   // --- controller state ------------------------------------------------------
 
   /// Decodes controller state pushed by the server and republishes it locally.
@@ -565,9 +699,15 @@ private:
 
   std::atomic<std::uint64_t> states_received_{0};
   std::atomic<std::uint64_t> states_published_{0};
+  std::atomic<std::uint64_t> buttons_sent_{0};
+
+  // Touched only by the executor thread (the Joy callback), so no atomic and no
+  // lock: the send path for buttons runs entirely inside that callback.
+  std::vector<std::uint8_t> last_buttons_sent_;
 
   rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr left_sub_;
   rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr right_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr buttons_sub_;
   rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
     left_state_pub_;
   rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
