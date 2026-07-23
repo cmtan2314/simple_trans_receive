@@ -17,6 +17,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <control_msgs/msg/joint_trajectory_controller_state.hpp>
+#include <control_msgs/msg/multi_dof_command.hpp>
 #include <sensor_msgs/msg/joy.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
@@ -35,6 +36,21 @@ constexpr const char * kLeftArmTrajectoryTopic =
   "/left_joint_trajectory_controller/joint_trajectory";
 constexpr const char * kRightArmTrajectoryTopic =
   "/right_joint_trajectory_controller/joint_trajectory";
+
+// The same commanded pose is mirrored to the arm PID controllers, which add an
+// integral torque term on top of gravity compensation to cancel the static
+// droop a grasped payload causes. They read state from the hardware themselves;
+// all they need from here is the setpoint, so this carries positions only.
+//
+// Publishing is unconditional: if the controllers are not spawned (the launch
+// flag use_payload_compensation defaults to false) these topics simply have no
+// subscriber, which costs nothing. Sending the setpoint from the same call that
+// publishes the trajectory is the point -- it cannot drift out of step with the
+// pose the position controller is tracking.
+constexpr const char * kLeftArmPidReferenceTopic = "/left_arm_pid_controller/reference";
+constexpr const char * kRightArmPidReferenceTopic = "/right_arm_pid_controller/reference";
+
+constexpr std::size_t kPidReferenceQueueDepth = 10;
 
 // Measured state from the local controllers, forwarded to the client.
 constexpr const char * kLeftControllerStateTopic =
@@ -189,6 +205,9 @@ public:
     RCLCPP_INFO(
       get_logger(), "publishing on '%s' and '%s' (depth %zu, reliable)",
       kLeftArmTrajectoryTopic, kRightArmTrajectoryTopic, kTrajectoryQueueDepth);
+    RCLCPP_INFO(
+      get_logger(), "mirroring the setpoint to '%s' and '%s' (depth %zu, reliable)",
+      kLeftArmPidReferenceTopic, kRightArmPidReferenceTopic, kPidReferenceQueueDepth);
     RCLCPP_INFO(
       get_logger(), "subscribed to '%s' and '%s' (depth %zu, reliable)",
       kLeftControllerStateTopic, kRightControllerStateTopic, kStateQueueDepth);
@@ -519,6 +538,55 @@ private:
     publisher->publish(message);
     messages_published_.fetch_add(1, std::memory_order_relaxed);
     ++window_published_;
+
+    publish_pid_reference(side, positions);
+  }
+
+  /// Mirrors the pose just sent to the trajectory controller onto the arm's PID
+  /// reference topic.
+  ///
+  /// Called from publish_trajectory() rather than standing on its own so the two
+  /// setpoints leave together and cannot disagree. A failure here is not counted
+  /// as a dropped packet: the trajectory has already gone out, so the arm still
+  /// moves -- only the droop compensation is missing, which is a degraded mode,
+  /// not a lost command.
+  void publish_pid_reference(ArmSide side, const std::vector<double> & positions)
+  {
+    if (positions.size() != kNumArmJoints) {                 // Rule 3: size guard
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s] %zu positions, expected %zu, not publishing a PID reference",
+        transrecv_udp::to_string(side), positions.size(), kNumArmJoints);
+      return;
+    }
+
+    const auto & publisher = pid_reference_publishers_[arm_index(side)];
+    if (publisher == nullptr) {                              // Rule 3: null guard
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s] PID reference publisher is null, not publishing",
+        transrecv_udp::to_string(side));
+      return;
+    }
+
+    control_msgs::msg::MultiDOFCommand message;
+    message.dof_names = transrecv_udp::arm_joint_names(side);
+
+    if (message.dof_names.size() != positions.size()) {      // Rule 3: size guard
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s] %zu joint names for %zu positions, not publishing a PID reference",
+        transrecv_udp::to_string(side), message.dof_names.size(), positions.size());
+      return;
+    }
+
+    message.values = positions;
+    // values_dot stays empty: the controllers are configured with
+    // reference_and_state_interfaces = [position], so a velocity reference would
+    // be ignored. Sending one anyway would only invite a size mismatch.
+
+    publisher->publish(message);
+    pid_references_published_.fetch_add(1, std::memory_order_relaxed);
   }
 
   // --- controller state ------------------------------------------------------
@@ -650,6 +718,7 @@ private:
     const std::uint64_t published = messages_published_.load(std::memory_order_relaxed);
     const std::uint64_t dropped = packets_dropped_.load(std::memory_order_relaxed);
     const std::uint64_t pongs = pongs_sent_.load(std::memory_order_relaxed);
+    const std::uint64_t pid_references = pid_references_published_.load(std::memory_order_relaxed);
 
     if (received == 0) {
       // last_receive_time_ is still its zero value here, so its age is
@@ -680,10 +749,14 @@ private:
       return;
     }
 
+    // pid_refs trailing published means a PID reference was skipped while the
+    // trajectory went out -- droop compensation is degraded, the arm is not.
     RCLCPP_INFO(
-      get_logger(), "health: OK | port=%u received=%lu published=%lu pongs=%lu dropped=%lu",
+      get_logger(),
+      "health: OK | port=%u received=%lu published=%lu pid_refs=%lu pongs=%lu dropped=%lu",
       port_, static_cast<unsigned long>(received), static_cast<unsigned long>(published),
-      static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped));
+      static_cast<unsigned long>(pid_references), static_cast<unsigned long>(pongs),
+      static_cast<unsigned long>(dropped));
   }
 
   /// The newest controller state for one arm, waiting to be sent.
@@ -705,6 +778,7 @@ private:
   // Written by the receive thread, read by the health thread.
   std::atomic<std::uint64_t> packets_received_{0};
   std::atomic<std::uint64_t> messages_published_{0};
+  std::atomic<std::uint64_t> pid_references_published_{0};
   std::atomic<std::uint64_t> packets_dropped_{0};
   std::atomic<std::uint64_t> pongs_sent_{0};
   std::atomic<std::chrono::steady_clock::time_point> last_receive_time_{
@@ -726,6 +800,9 @@ private:
 
   std::array<rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr, kNumArms>
   publishers_;
+
+  std::array<rclcpp::Publisher<control_msgs::msg::MultiDOFCommand>::SharedPtr, kNumArms>
+  pid_reference_publishers_;
 
   rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr buttons_pub_;
 
