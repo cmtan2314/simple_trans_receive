@@ -11,6 +11,7 @@ find_package(rclcpp REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 
 # Both ends share the same headers (protocol, socket, watchdog), so build them
 # the same way instead of repeating the settings per target.
@@ -20,7 +21,7 @@ foreach(node server client)
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
   target_compile_features(${node} PRIVATE cxx_std_17)
-  ament_target_dependencies(${node} rclcpp trajectory_msgs control_msgs sensor_msgs)
+  ament_target_dependencies(${node} rclcpp trajectory_msgs control_msgs sensor_msgs geometry_msgs)
 endforeach()
 
 install(TARGETS server client

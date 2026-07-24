@@ -28,8 +28,8 @@ namespace transrecv_udp
 ///
 /// Every packet type has a different fixed size, so a datagram is classified by
 /// length before anything is decoded, and a wrong-sized one is rejected on size
-/// alone: ControlPacket 8, ButtonPacket 12, JointPacket 64. The static_asserts
-/// below enforce that they stay distinct.
+/// alone: ControlPacket 8, ButtonPacket 12, PosePacket 36, HandJointPacket 56,
+/// JointPacket 64. The static_asserts below enforce that they stay distinct.
 
 // Each arm is a 7-DOF OpenArm. Single source of truth for every buffer size.
 constexpr std::size_t kNumArmJoints = 7;
@@ -284,6 +284,179 @@ inline std::vector<std::string> arm_joint_names(ArmSide side)
   names.reserve(kNumArmJoints);
   for (std::size_t i = 0; i < kNumArmJoints; ++i) {
     names.push_back(prefix + std::to_string(i + 1));
+  }
+  return names;
+}
+
+// --- End-effector pose -------------------------------------------------------
+// FK-derived pose for one arm, forwarded from ee_pose_{left,right}
+// (dora_ros2_bridge/main.py) to /left_ee_pose or /right_ee_pose.
+constexpr std::size_t kPoseValues = 7;  // px, py, pz, qw, qx, qy, qz
+
+#pragma pack(push, 1)
+struct PosePacket
+{
+  std::uint32_t magic;
+  std::uint32_t arm;
+  // float, not double: the source (extract_pose() in main.py) is float32-only,
+  // so double would add wire bytes with no real precision. It also keeps this
+  // size distinct from JointPacket's, which otherwise carries the same 7
+  // numbers per arm side and would collide with it.
+  float values[kPoseValues];
+};
+#pragma pack(pop)
+
+constexpr std::size_t kPosePacketBytes =
+  sizeof(std::uint32_t) * 2 + sizeof(float) * kPoseValues;
+static_assert(
+  sizeof(PosePacket) == kPosePacketBytes,
+  "PosePacket must be tightly packed for the wire format");
+static_assert(
+  sizeof(PosePacket) != sizeof(ControlPacket) &&
+  sizeof(PosePacket) != sizeof(ButtonPacket) &&
+  sizeof(PosePacket) != sizeof(JointPacket),
+  "every packet type must have a distinct size, that is how they are told apart");
+
+/// Fills a pose packet. `values` must hold exactly kPoseValues entries
+/// (px,py,pz,qw,qx,qy,qz); the caller checks that (and logs) before calling.
+inline PosePacket make_pose_packet(ArmSide arm, const std::vector<double> & values)
+{
+  PosePacket packet{};
+  packet.magic = htonl(kPacketMagic);
+  packet.arm = htonl(static_cast<std::uint32_t>(arm));
+
+  if (values.size() == kPoseValues) {               // Rule 3: never copy a wrong size
+    for (std::size_t i = 0; i < kPoseValues; ++i) {
+      packet.values[i] = static_cast<float>(values[i]);
+    }
+  }
+  return packet;
+}
+
+/// Validates and decodes a pose datagram. Returns false (with `reason` for the
+/// caller to log) on wrong size, bad magic or unknown arm.
+inline bool decode_pose_packet(
+  const void * data, std::size_t length, ArmSide & arm_out, std::vector<double> & out,
+  std::string & reason)
+{
+  if (data == nullptr) {                            // Rule 3: null guard
+    reason = "null buffer";
+    return false;
+  }
+
+  if (length != sizeof(PosePacket)) {               // Rule 3: size guard
+    reason = "size " + std::to_string(length) + " != " + std::to_string(sizeof(PosePacket));
+    return false;
+  }
+
+  PosePacket packet{};
+  std::memcpy(&packet, data, sizeof(packet));
+
+  if (ntohl(packet.magic) != kPacketMagic) {        // Rule 3: not ours
+    reason = "bad magic";
+    return false;
+  }
+
+  const std::uint32_t arm = ntohl(packet.arm);
+  if (arm > static_cast<std::uint32_t>(ArmSide::kRight)) {   // Rule 3: enum range
+    reason = "unknown arm " + std::to_string(arm);
+    return false;
+  }
+
+  arm_out = static_cast<ArmSide>(arm);
+  out.assign(packet.values, packet.values + kPoseValues);
+  return true;
+}
+
+// --- Revo2 hand (gripper) joint trajectory -----------------------------------
+// 6 driven joints per hand (thumb metacarpal/proximal + 4 finger proximals),
+// forwarded from {left,right}_revo2_hand_controller/joint_trajectory
+// (dora_ros2_bridge/main.py) to the same-named topic on the server.
+constexpr std::size_t kNumHandJoints = 6;
+
+#pragma pack(push, 1)
+struct HandJointPacket
+{
+  std::uint32_t magic;
+  std::uint32_t arm;
+  double positions[kNumHandJoints];
+};
+#pragma pack(pop)
+
+constexpr std::size_t kHandJointPacketBytes =
+  sizeof(std::uint32_t) * 2 + sizeof(double) * kNumHandJoints;
+static_assert(
+  sizeof(HandJointPacket) == kHandJointPacketBytes,
+  "HandJointPacket must be tightly packed for the wire format");
+static_assert(
+  sizeof(HandJointPacket) != sizeof(ControlPacket) &&
+  sizeof(HandJointPacket) != sizeof(ButtonPacket) &&
+  sizeof(HandJointPacket) != sizeof(PosePacket) &&
+  sizeof(HandJointPacket) != sizeof(JointPacket),
+  "every packet type must have a distinct size, that is how they are told apart");
+
+/// Fills a hand packet. `positions` must hold exactly kNumHandJoints entries;
+/// the caller checks that (and logs) before calling.
+inline HandJointPacket make_hand_packet(ArmSide arm, const std::vector<double> & positions)
+{
+  HandJointPacket packet{};
+  packet.magic = htonl(kPacketMagic);
+  packet.arm = htonl(static_cast<std::uint32_t>(arm));
+
+  if (positions.size() == kNumHandJoints) {         // Rule 3: never copy a wrong size
+    std::memcpy(packet.positions, positions.data(), sizeof(packet.positions));
+  }
+  return packet;
+}
+
+/// Validates and decodes a hand datagram. Returns false (with `reason` for the
+/// caller to log) on wrong size, bad magic or unknown arm.
+inline bool decode_hand_packet(
+  const void * data, std::size_t length, ArmSide & arm_out, std::vector<double> & out,
+  std::string & reason)
+{
+  if (data == nullptr) {                            // Rule 3: null guard
+    reason = "null buffer";
+    return false;
+  }
+
+  if (length != sizeof(HandJointPacket)) {          // Rule 3: size guard
+    reason = "size " + std::to_string(length) + " != " + std::to_string(sizeof(HandJointPacket));
+    return false;
+  }
+
+  HandJointPacket packet{};
+  std::memcpy(&packet, data, sizeof(packet));
+
+  if (ntohl(packet.magic) != kPacketMagic) {        // Rule 3: not ours
+    reason = "bad magic";
+    return false;
+  }
+
+  const std::uint32_t arm = ntohl(packet.arm);
+  if (arm > static_cast<std::uint32_t>(ArmSide::kRight)) {   // Rule 3: enum range
+    reason = "unknown arm " + std::to_string(arm);
+    return false;
+  }
+
+  arm_out = static_cast<ArmSide>(arm);
+  out.assign(packet.positions, packet.positions + kNumHandJoints);
+  return true;
+}
+
+// Joint names for the Revo2 hand, matching HAND_FINGERS/NAMES_L_HAND/
+// NAMES_R_HAND in dora_ros2_bridge/main.py.
+inline std::vector<std::string> hand_joint_names(ArmSide side)
+{
+  static const char * const kFingers[kNumHandJoints] = {
+    "thumb_metacarpal", "thumb_proximal", "index_proximal",
+    "middle_proximal", "ring_proximal", "pinky_proximal"};
+
+  const std::string prefix = side == ArmSide::kLeft ? "left_" : "right_";
+  std::vector<std::string> names;
+  names.reserve(kNumHandJoints);
+  for (const char * finger : kFingers) {
+    names.push_back(prefix + finger + "_joint");
   }
   return names;
 }

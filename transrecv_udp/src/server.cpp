@@ -17,6 +17,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <control_msgs/msg/joint_trajectory_controller_state.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <sensor_msgs/msg/joy.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
@@ -28,6 +29,7 @@ namespace
 {
 using transrecv_udp::ArmSide;
 using transrecv_udp::kNumArmJoints;
+using transrecv_udp::kNumHandJoints;
 
 // Joint state arriving from the client is republished here as a command, i.e.
 // straight onto the topics the arm controllers consume.
@@ -47,8 +49,20 @@ constexpr std::size_t kTrajectoryQueueDepth = 10;
 // VR face buttons received from the client and republished here.
 constexpr const char * kVrButtonsTopic = "/vr_buttons";
 
+// FK end-effector pose received from the client and republished here.
+constexpr const char * kLeftEePoseTopic = "/left_ee_pose";
+constexpr const char * kRightEePoseTopic = "/right_ee_pose";
+
+// Revo2 hand (gripper) commands received from the client and republished here.
+constexpr const char * kLeftHandTrajectoryTopic = "/left_revo2_hand_controller/joint_trajectory";
+constexpr const char * kRightHandTrajectoryTopic = "/right_revo2_hand_controller/joint_trajectory";
+
 constexpr std::size_t kStateQueueDepth = 10;
 constexpr std::size_t kButtonQueueDepth = 10;
+// ee_pose is a high-rate stream like buttons; best_effort matches the source's
+// nature (dora_ros2_bridge's qos_best_effort) rather than forcing reliable
+// everywhere.
+constexpr std::size_t kPoseQueueDepth = 10;
 
 // Both arms, indexed by ArmSide.
 constexpr std::size_t kNumArms = 2;
@@ -174,6 +188,17 @@ public:
     buttons_pub_ = create_publisher<sensor_msgs::msg::Joy>(
       kVrButtonsTopic, rclcpp::QoS(kButtonQueueDepth).reliable());
 
+    const rclcpp::QoS pose_qos = rclcpp::QoS(kPoseQueueDepth).best_effort();
+    left_ee_pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
+      kLeftEePoseTopic, pose_qos);
+    right_ee_pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
+      kRightEePoseTopic, pose_qos);
+
+    left_hand_pub_ = create_publisher<trajectory_msgs::msg::JointTrajectory>(
+      kLeftHandTrajectoryTopic, qos);
+    right_hand_pub_ = create_publisher<trajectory_msgs::msg::JointTrajectory>(
+      kRightHandTrajectoryTopic, qos);
+
     const rclcpp::QoS state_qos = rclcpp::QoS(kStateQueueDepth).reliable();
     left_state_sub_ = create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
       kLeftControllerStateTopic, state_qos,
@@ -189,6 +214,12 @@ public:
     RCLCPP_INFO(
       get_logger(), "publishing on '%s' and '%s' (depth %zu, reliable)",
       kLeftArmTrajectoryTopic, kRightArmTrajectoryTopic, kTrajectoryQueueDepth);
+    RCLCPP_INFO(
+      get_logger(), "publishing on '%s' and '%s' (depth %zu, best_effort)",
+      kLeftEePoseTopic, kRightEePoseTopic, kPoseQueueDepth);
+    RCLCPP_INFO(
+      get_logger(), "publishing on '%s' and '%s' (depth %zu, reliable)",
+      kLeftHandTrajectoryTopic, kRightHandTrajectoryTopic, kTrajectoryQueueDepth);
     RCLCPP_INFO(
       get_logger(), "subscribed to '%s' and '%s' (depth %zu, reliable)",
       kLeftControllerStateTopic, kRightControllerStateTopic, kStateQueueDepth);
@@ -292,6 +323,16 @@ private:
 
     if (length == sizeof(transrecv_udp::ButtonPacket)) {
       handle_buttons(data, length);
+      return;
+    }
+
+    if (length == sizeof(transrecv_udp::PosePacket)) {
+      handle_ee_pose(data, length);
+      return;
+    }
+
+    if (length == sizeof(transrecv_udp::HandJointPacket)) {
+      handle_hand(data, length);
       return;
     }
 
@@ -437,6 +478,109 @@ private:
     RCLCPP_INFO(get_logger(), "buttons published: %s]", text.c_str());
   }
 
+  /// Republishes an FK end-effector pose received from the client.
+  void handle_ee_pose(const unsigned char * data, std::size_t length)
+  {
+    poses_received_.fetch_add(1, std::memory_order_relaxed);
+
+    ArmSide arm = ArmSide::kLeft;
+    std::vector<double> values;
+    std::string reason;
+    if (!transrecv_udp::decode_pose_packet(data, length, arm, values, reason)) {
+      RCLCPP_WARN_THROTTLE(                                    // Rule 2: reject, don't guess
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "malformed pose datagram dropped: %s", reason.c_str());
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    if (values.size() != transrecv_udp::kPoseValues) {         // Rule 3: size guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] decoded %zu pose values, expected %zu, not publishing",
+        transrecv_udp::to_string(arm), values.size(), transrecv_udp::kPoseValues);
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    const auto & publisher = arm == ArmSide::kLeft ? left_ee_pose_pub_ : right_ee_pose_pub_;
+    if (publisher == nullptr) {                                // Rule 3: null guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] ee_pose publisher is null, dropping", transrecv_udp::to_string(arm));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    geometry_msgs::msg::PoseStamped message;
+    message.header.stamp = now();
+    message.pose.position.x = values[0];
+    message.pose.position.y = values[1];
+    message.pose.position.z = values[2];
+    message.pose.orientation.w = values[3];
+    message.pose.orientation.x = values[4];
+    message.pose.orientation.y = values[5];
+    message.pose.orientation.z = values[6];
+    publisher->publish(message);
+
+    poses_published_.fetch_add(1, std::memory_order_relaxed);
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kDataLogThrottleMs,
+      "[%s] ee_pose published: pos=[%.3f %.3f %.3f] quat=[%.3f %.3f %.3f %.3f]",
+      transrecv_udp::to_string(arm), values[0], values[1], values[2],
+      values[3], values[4], values[5], values[6]);
+  }
+
+  /// Republishes a Revo2 hand (gripper) command received from the client.
+  void handle_hand(const unsigned char * data, std::size_t length)
+  {
+    hands_received_.fetch_add(1, std::memory_order_relaxed);
+
+    ArmSide arm = ArmSide::kLeft;
+    std::vector<double> positions;
+    std::string reason;
+    if (!transrecv_udp::decode_hand_packet(data, length, arm, positions, reason)) {
+      RCLCPP_WARN_THROTTLE(                                    // Rule 2: reject, don't guess
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "malformed hand datagram dropped: %s", reason.c_str());
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    if (positions.size() != kNumHandJoints) {                  // Rule 3: size guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] decoded %zu hand positions, expected %zu, not publishing",
+        transrecv_udp::to_string(arm), positions.size(), kNumHandJoints);
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    const auto & publisher = arm == ArmSide::kLeft ? left_hand_pub_ : right_hand_pub_;
+    if (publisher == nullptr) {                                // Rule 3: null guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] hand publisher is null, dropping", transrecv_udp::to_string(arm));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    trajectory_msgs::msg::JointTrajectory message;
+    message.header.stamp = now();
+    message.joint_names = transrecv_udp::hand_joint_names(arm);
+
+    trajectory_msgs::msg::JointTrajectoryPoint point;
+    point.positions = positions;
+    // time_from_start stays zero: same as the arm command path, "go there now".
+    message.points.push_back(point);
+
+    publisher->publish(message);
+    hands_published_.fetch_add(1, std::memory_order_relaxed);
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kDataLogThrottleMs,
+      "[%s] hand published: [%.3f %.3f %.3f %.3f %.3f %.3f]",
+      transrecv_udp::to_string(arm), positions[0], positions[1], positions[2],
+      positions[3], positions[4], positions[5]);
+  }
+
   /// Answers a client's liveness ping. This reply is the only thing the server
   /// ever sends: it carries no data, it just proves the server is alive, which
   /// is something the client cannot establish on its own over UDP.
@@ -513,6 +657,7 @@ private:
     }
 
     trajectory_msgs::msg::JointTrajectory message;
+    message.header.stamp = now();
     message.joint_names = transrecv_udp::arm_joint_names(side);
 
     trajectory_msgs::msg::JointTrajectoryPoint point;
@@ -656,6 +801,10 @@ private:
     const std::uint64_t pongs = pongs_sent_.load(std::memory_order_relaxed);
     const std::uint64_t buttons_in = buttons_received_.load(std::memory_order_relaxed);
     const std::uint64_t buttons_out = buttons_published_.load(std::memory_order_relaxed);
+    const std::uint64_t poses_in = poses_received_.load(std::memory_order_relaxed);
+    const std::uint64_t poses_out = poses_published_.load(std::memory_order_relaxed);
+    const std::uint64_t hands_in = hands_received_.load(std::memory_order_relaxed);
+    const std::uint64_t hands_out = hands_published_.load(std::memory_order_relaxed);
 
     if (received == 0) {
       // last_receive_time_ is still its zero value here, so its age is
@@ -665,10 +814,13 @@ private:
       RCLCPP_WARN(
         get_logger(),
         "health: no joint data on port %u yet (client pings answered: %lu) "
-        "| published=%lu dropped=%lu buttons_received=%lu buttons_published=%lu",
+        "| published=%lu dropped=%lu buttons_received=%lu buttons_published=%lu "
+        "poses_received=%lu poses_published=%lu hands_received=%lu hands_published=%lu",
         port_, static_cast<unsigned long>(pongs), static_cast<unsigned long>(published),
         static_cast<unsigned long>(dropped), static_cast<unsigned long>(buttons_in),
-        static_cast<unsigned long>(buttons_out));
+        static_cast<unsigned long>(buttons_out), static_cast<unsigned long>(poses_in),
+        static_cast<unsigned long>(poses_out), static_cast<unsigned long>(hands_in),
+        static_cast<unsigned long>(hands_out));
       return;
     }
 
@@ -680,22 +832,28 @@ private:
         get_logger(),
         "health: no datagram for %lds (client stalled?) "
         "| received=%lu published=%lu pongs=%lu dropped=%lu buttons_received=%lu "
-        "buttons_published=%lu",
+        "buttons_published=%lu poses_received=%lu poses_published=%lu hands_received=%lu "
+        "hands_published=%lu",
         static_cast<long>(
           std::chrono::duration_cast<std::chrono::seconds>(since_receive).count()),
         static_cast<unsigned long>(received), static_cast<unsigned long>(published),
         static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped),
-        static_cast<unsigned long>(buttons_in), static_cast<unsigned long>(buttons_out));
+        static_cast<unsigned long>(buttons_in), static_cast<unsigned long>(buttons_out),
+        static_cast<unsigned long>(poses_in), static_cast<unsigned long>(poses_out),
+        static_cast<unsigned long>(hands_in), static_cast<unsigned long>(hands_out));
       return;
     }
 
     RCLCPP_INFO(
       get_logger(),
       "health: OK | port=%u received=%lu published=%lu pongs=%lu dropped=%lu "
-      "buttons_received=%lu buttons_published=%lu",
+      "buttons_received=%lu buttons_published=%lu poses_received=%lu poses_published=%lu "
+      "hands_received=%lu hands_published=%lu",
       port_, static_cast<unsigned long>(received), static_cast<unsigned long>(published),
       static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped),
-      static_cast<unsigned long>(buttons_in), static_cast<unsigned long>(buttons_out));
+      static_cast<unsigned long>(buttons_in), static_cast<unsigned long>(buttons_out),
+      static_cast<unsigned long>(poses_in), static_cast<unsigned long>(poses_out),
+      static_cast<unsigned long>(hands_in), static_cast<unsigned long>(hands_out));
   }
 
   /// The newest controller state for one arm, waiting to be sent.
@@ -736,11 +894,19 @@ private:
   // Written by the receive thread.
   std::atomic<std::uint64_t> buttons_received_{0};
   std::atomic<std::uint64_t> buttons_published_{0};
+  std::atomic<std::uint64_t> poses_received_{0};
+  std::atomic<std::uint64_t> poses_published_{0};
+  std::atomic<std::uint64_t> hands_received_{0};
+  std::atomic<std::uint64_t> hands_published_{0};
 
   std::array<rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr, kNumArms>
   publishers_;
 
   rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr buttons_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr left_ee_pose_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr right_ee_pose_pub_;
+  rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr left_hand_pub_;
+  rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr right_hand_pub_;
 
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
     left_state_sub_;

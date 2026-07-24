@@ -17,6 +17,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <control_msgs/msg/joint_trajectory_controller_state.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <sensor_msgs/msg/joy.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
@@ -28,6 +29,7 @@ namespace
 {
 using transrecv_udp::ArmSide;
 using transrecv_udp::kNumArmJoints;
+using transrecv_udp::kNumHandJoints;
 
 // Joint commands going into the local controllers, mirrored to the server.
 constexpr const char * kLeftArmCommandTopic =
@@ -45,11 +47,26 @@ constexpr const char * kRightControllerStateTopic =
 // `axes` is left alone because the joysticks travel on their own path.
 constexpr const char * kVrButtonsTopic = "/vr_buttons";
 
+// FK end-effector pose, mirrored to the server. Published by dora_ros2_bridge
+// only when the dataflow wires an fk node's pose_{left,right} output.
+constexpr const char * kLeftEePoseTopic = "/left_ee_pose";
+constexpr const char * kRightEePoseTopic = "/right_ee_pose";
+
+// Revo2 hand (gripper) commands, mirrored to the server.
+constexpr const char * kLeftHandCommandTopic = "/left_revo2_hand_controller/joint_trajectory";
+constexpr const char * kRightHandCommandTopic = "/right_revo2_hand_controller/joint_trajectory";
+
 constexpr std::size_t kStateQueueDepth = 10;
 
-// Buttons are events, not a stream: a small depth is plenty, and the reliable
-// QoS is what stops a press from being dropped locally before we ever see it.
+// Buttons are events, not a stream, so a small depth is plenty. The publisher
+// (dora_to_ros2) offers BEST_EFFORT; a RELIABLE subscription is incompatible
+// with that (a stricter subscriber cannot be satisfied by a laxer publisher),
+// so the subscription below must match it or DDS never delivers a message.
 constexpr std::size_t kButtonQueueDepth = 10;
+
+// Same BEST_EFFORT reasoning as kButtonQueueDepth above: dora_ros2_bridge
+// publishes ee_pose with its qos_best_effort profile too.
+constexpr std::size_t kPoseQueueDepth = 10;
 
 // Commands arrive at a high rate: throttle per-packet logs.
 constexpr int kLogThrottleMs = 1000;
@@ -144,8 +161,31 @@ public:
       });
 
     buttons_sub_ = create_subscription<sensor_msgs::msg::Joy>(
-      kVrButtonsTopic, rclcpp::QoS(kButtonQueueDepth).reliable(),
+      kVrButtonsTopic, rclcpp::QoS(kButtonQueueDepth).best_effort(),
       [this](sensor_msgs::msg::Joy::ConstSharedPtr msg) { on_vr_buttons(msg); });
+
+    const rclcpp::QoS pose_qos = rclcpp::QoS(kPoseQueueDepth).best_effort();
+    left_ee_pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+      kLeftEePoseTopic, pose_qos,
+      [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
+        on_ee_pose(ArmSide::kLeft, msg);
+      });
+    right_ee_pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+      kRightEePoseTopic, pose_qos,
+      [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
+        on_ee_pose(ArmSide::kRight, msg);
+      });
+
+    left_hand_sub_ = create_subscription<trajectory_msgs::msg::JointTrajectory>(
+      kLeftHandCommandTopic, qos,
+      [this](trajectory_msgs::msg::JointTrajectory::ConstSharedPtr msg) {
+        on_hand_trajectory(ArmSide::kLeft, msg);
+      });
+    right_hand_sub_ = create_subscription<trajectory_msgs::msg::JointTrajectory>(
+      kRightHandCommandTopic, qos,
+      [this](trajectory_msgs::msg::JointTrajectory::ConstSharedPtr msg) {
+        on_hand_trajectory(ArmSide::kRight, msg);
+      });
 
     left_state_pub_ = create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
       kLeftControllerStateTopic, qos);
@@ -161,6 +201,12 @@ public:
     RCLCPP_INFO(
       get_logger(), "mirroring '%s' to %s, on change only",
       kVrButtonsTopic, server_text_.c_str());
+    RCLCPP_INFO(
+      get_logger(), "forwarding '%s' and '%s' to %s (best_effort)",
+      kLeftEePoseTopic, kRightEePoseTopic, server_text_.c_str());
+    RCLCPP_INFO(
+      get_logger(), "forwarding '%s' and '%s' to %s",
+      kLeftHandCommandTopic, kRightHandCommandTopic, server_text_.c_str());
     RCLCPP_INFO(
       get_logger(), "pinging %s every %ldms, link is down after %ldms without an answer",
       server_text_.c_str(), static_cast<long>(kPingPeriod.count()),
@@ -457,6 +503,172 @@ private:
     return true;
   }
 
+  // --- end-effector pose -----------------------------------------------------
+
+  void on_ee_pose(ArmSide side, geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
+  {
+    if (msg == nullptr) {                                      // Rule 3: null guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] null ee_pose, dropping", transrecv_udp::to_string(side));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    // Order matches make_ee_pose_msg() in dora_ros2_bridge/main.py.
+    const std::vector<double> values = {
+      msg->pose.position.x, msg->pose.position.y, msg->pose.position.z,
+      msg->pose.orientation.w, msg->pose.orientation.x,
+      msg->pose.orientation.y, msg->pose.orientation.z};
+
+    if (!send_pose_packet(side, values)) {
+      return;
+    }
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kLogThrottleMs,
+      "[%s] ee_pose sent: pos=[%.3f %.3f %.3f] quat=[%.3f %.3f %.3f %.3f]",
+      transrecv_udp::to_string(side), values[0], values[1], values[2],
+      values[3], values[4], values[5], values[6]);
+  }
+
+  bool send_pose_packet(ArmSide side, const std::vector<double> & values)
+  {
+    if (!socket_.valid()) {                                    // Rule 3: use-before-init
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s] socket not open, cannot send ee_pose", transrecv_udp::to_string(side));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    if (!connected_.load(std::memory_order_relaxed)) {         // Rule 2: waiting on the retry
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s] not connected to %s, dropping ee_pose",
+        transrecv_udp::to_string(side), server_text_.c_str());
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    const transrecv_udp::PosePacket packet = transrecv_udp::make_pose_packet(side, values);
+    const ssize_t sent = send(socket_.get(), &packet, sizeof(packet), 0);
+
+    if (sent < 0) {
+      if (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EHOSTUNREACH) {
+        mark_disconnected(std::strerror(errno));               // hand it to the retry thread
+      } else {
+        RCLCPP_WARN_THROTTLE(                                  // Rule 2: log the failure path
+          get_logger(), *get_clock(), kLogThrottleMs,
+          "[%s] send(ee_pose) failed: %s", transrecv_udp::to_string(side), std::strerror(errno));
+      }
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    if (static_cast<std::size_t>(sent) != sizeof(packet)) {     // Rule 3: short-write guard
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s] short ee_pose send: %zd of %zu bytes", transrecv_udp::to_string(side), sent,
+        sizeof(packet));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    poses_sent_.fetch_add(1, std::memory_order_relaxed);
+    last_send_time_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+    return true;
+  }
+
+  // --- Revo2 hand --------------------------------------------------------------
+
+  void on_hand_trajectory(
+    ArmSide side, trajectory_msgs::msg::JointTrajectory::ConstSharedPtr msg)
+  {
+    if (msg == nullptr) {                                      // Rule 3: null guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] null hand trajectory, dropping", transrecv_udp::to_string(side));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    if (msg->points.empty()) {                                 // Rule 3: empty guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] hand trajectory has no points, dropping",
+        transrecv_udp::to_string(side));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    const std::vector<double> & commanded = msg->points.back().positions;
+    if (commanded.size() < kNumHandJoints) {                   // Rule 3: size guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] hand trajectory point has %zu positions, need %zu, dropping",
+        transrecv_udp::to_string(side), commanded.size(), kNumHandJoints);
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    const std::vector<double> positions(commanded.begin(), commanded.begin() + kNumHandJoints);
+
+    if (!send_hand_packet(side, positions)) {
+      return;
+    }
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kLogThrottleMs,
+      "[%s] hand sent: [%.3f %.3f %.3f %.3f %.3f %.3f]",
+      transrecv_udp::to_string(side), positions[0], positions[1], positions[2],
+      positions[3], positions[4], positions[5]);
+  }
+
+  bool send_hand_packet(ArmSide side, const std::vector<double> & positions)
+  {
+    if (!socket_.valid()) {                                    // Rule 3: use-before-init
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s] socket not open, cannot send hand command", transrecv_udp::to_string(side));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    if (!connected_.load(std::memory_order_relaxed)) {         // Rule 2: waiting on the retry
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s] not connected to %s, dropping hand command",
+        transrecv_udp::to_string(side), server_text_.c_str());
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    const transrecv_udp::HandJointPacket packet = transrecv_udp::make_hand_packet(side, positions);
+    const ssize_t sent = send(socket_.get(), &packet, sizeof(packet), 0);
+
+    if (sent < 0) {
+      if (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EHOSTUNREACH) {
+        mark_disconnected(std::strerror(errno));               // hand it to the retry thread
+      } else {
+        RCLCPP_WARN_THROTTLE(                                  // Rule 2: log the failure path
+          get_logger(), *get_clock(), kLogThrottleMs,
+          "[%s] send(hand) failed: %s", transrecv_udp::to_string(side), std::strerror(errno));
+      }
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    if (static_cast<std::size_t>(sent) != sizeof(packet)) {     // Rule 3: short-write guard
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s] short hand send: %zd of %zu bytes", transrecv_udp::to_string(side), sent,
+        sizeof(packet));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    hands_sent_.fetch_add(1, std::memory_order_relaxed);
+    last_send_time_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+    return true;
+  }
+
   // --- VR buttons ------------------------------------------------------------
 
   /// Mirrors button state to the server, but only when it actually changed.
@@ -653,14 +865,18 @@ private:
     const std::uint64_t pings = pings_sent_.load(std::memory_order_relaxed);
     const std::uint64_t pongs = pongs_received_.load(std::memory_order_relaxed);
     const std::uint64_t buttons = buttons_sent_.load(std::memory_order_relaxed);
+    const std::uint64_t poses = poses_sent_.load(std::memory_order_relaxed);
+    const std::uint64_t hands = hands_sent_.load(std::memory_order_relaxed);
 
     if (!connected_.load(std::memory_order_relaxed)) {       // Rule 2: state-dependent branch
       RCLCPP_WARN(
         get_logger(),
-        "health: not connected to %s | pings=%lu pongs=%lu dropped=%lu buttons_sent=%lu",
+        "health: not connected to %s | pings=%lu pongs=%lu dropped=%lu buttons_sent=%lu "
+        "poses_sent=%lu hands_sent=%lu",
         server_text_.c_str(), static_cast<unsigned long>(pings),
         static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped),
-        static_cast<unsigned long>(buttons));
+        static_cast<unsigned long>(buttons), static_cast<unsigned long>(poses),
+        static_cast<unsigned long>(hands));
       return;
     }
 
@@ -670,9 +886,11 @@ private:
       RCLCPP_WARN(
         get_logger(),
         "health: connected to %s but no joint data sent yet "
-        "(are the controllers publishing state?) | pongs=%lu dropped=%lu buttons_sent=%lu",
+        "(are the controllers publishing state?) | pongs=%lu dropped=%lu buttons_sent=%lu "
+        "poses_sent=%lu hands_sent=%lu",
         server_text_.c_str(), static_cast<unsigned long>(pongs),
-        static_cast<unsigned long>(dropped), static_cast<unsigned long>(buttons));
+        static_cast<unsigned long>(dropped), static_cast<unsigned long>(buttons),
+        static_cast<unsigned long>(poses), static_cast<unsigned long>(hands));
       return;
     }
 
@@ -683,19 +901,23 @@ private:
       RCLCPP_WARN(
         get_logger(),
         "health: nothing sent for %lds (controller state stalled?) "
-        "| sent=%lu dropped=%lu buttons_sent=%lu",
+        "| sent=%lu dropped=%lu buttons_sent=%lu poses_sent=%lu hands_sent=%lu",
         static_cast<long>(
           std::chrono::duration_cast<std::chrono::seconds>(since_send).count()),
         static_cast<unsigned long>(sent), static_cast<unsigned long>(dropped),
-        static_cast<unsigned long>(buttons));
+        static_cast<unsigned long>(buttons), static_cast<unsigned long>(poses),
+        static_cast<unsigned long>(hands));
       return;
     }
 
     RCLCPP_INFO(
-      get_logger(), "health: OK | server=%s sent=%lu pongs=%lu dropped=%lu buttons_sent=%lu",
+      get_logger(),
+      "health: OK | server=%s sent=%lu pongs=%lu dropped=%lu buttons_sent=%lu "
+      "poses_sent=%lu hands_sent=%lu",
       server_text_.c_str(), static_cast<unsigned long>(sent),
       static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped),
-      static_cast<unsigned long>(buttons));
+      static_cast<unsigned long>(buttons), static_cast<unsigned long>(poses),
+      static_cast<unsigned long>(hands));
   }
 
   transrecv_udp::UdpSocket & socket_;
@@ -715,6 +937,8 @@ private:
   std::atomic<std::uint64_t> states_received_{0};
   std::atomic<std::uint64_t> states_published_{0};
   std::atomic<std::uint64_t> buttons_sent_{0};
+  std::atomic<std::uint64_t> poses_sent_{0};
+  std::atomic<std::uint64_t> hands_sent_{0};
 
   // Touched only by the executor thread (the Joy callback), so no atomic and no
   // lock: the send path for buttons runs entirely inside that callback.
@@ -723,6 +947,10 @@ private:
   rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr left_sub_;
   rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr right_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr buttons_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr left_ee_pose_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr right_ee_pose_sub_;
+  rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr left_hand_sub_;
+  rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr right_hand_sub_;
   rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
     left_state_pub_;
   rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
