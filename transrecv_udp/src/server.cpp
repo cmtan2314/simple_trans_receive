@@ -563,7 +563,12 @@ private:
     }
 
     trajectory_msgs::msg::JointTrajectory message;
-    message.header.stamp = now();
+    // header.stamp stays zero deliberately: joint_trajectory_controller treats
+    // a non-zero stamp as an absolute start time, and with time_from_start=0
+    // that start time is also the trajectory's end time. Stamping "now" here
+    // means it is already in the past by the time the controller processes
+    // it, so the controller rejects it ("trajectory ... ends in the past").
+    // Zero is the documented "execute immediately" convention.
     message.joint_names = transrecv_udp::hand_joint_names(arm);
 
     trajectory_msgs::msg::JointTrajectoryPoint point;
@@ -657,7 +662,12 @@ private:
     }
 
     trajectory_msgs::msg::JointTrajectory message;
-    message.header.stamp = now();
+    // header.stamp stays zero deliberately: joint_trajectory_controller treats
+    // a non-zero stamp as an absolute start time, and with time_from_start=0
+    // that start time is also the trajectory's end time. Stamping "now" here
+    // means it is already in the past by the time the controller processes
+    // it, so the controller rejects it ("trajectory ... ends in the past").
+    // Zero is the documented "execute immediately" convention.
     message.joint_names = transrecv_udp::arm_joint_names(side);
 
     trajectory_msgs::msg::JointTrajectoryPoint point;
