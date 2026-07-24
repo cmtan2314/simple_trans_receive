@@ -497,6 +497,15 @@ private:
       buttons[i] = msg->buttons[i] != 0 ? 1 : 0;
     }
 
+    // Throttled, and logged regardless of whether the state changed -- unlike
+    // the "sent" line below, this is here purely so a debugging session can
+    // see that /vr_buttons is actually arriving and what it currently reads,
+    // even when nothing is being forwarded to the server.
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kLogThrottleMs,
+      "buttons from '%s' (raw, %zu of %zu used): %s", kVrButtonsTopic, count,
+      msg->buttons.size(), describe_buttons(buttons).c_str());
+
     if (buttons == last_buttons_sent_) {                     // unchanged: stay silent
       RCLCPP_DEBUG(get_logger(), "button state unchanged, not sending");
       return;
@@ -643,12 +652,15 @@ private:
     const std::uint64_t dropped = packets_dropped_.load(std::memory_order_relaxed);
     const std::uint64_t pings = pings_sent_.load(std::memory_order_relaxed);
     const std::uint64_t pongs = pongs_received_.load(std::memory_order_relaxed);
+    const std::uint64_t buttons = buttons_sent_.load(std::memory_order_relaxed);
 
     if (!connected_.load(std::memory_order_relaxed)) {       // Rule 2: state-dependent branch
       RCLCPP_WARN(
-        get_logger(), "health: not connected to %s | pings=%lu pongs=%lu dropped=%lu",
+        get_logger(),
+        "health: not connected to %s | pings=%lu pongs=%lu dropped=%lu buttons_sent=%lu",
         server_text_.c_str(), static_cast<unsigned long>(pings),
-        static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped));
+        static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped),
+        static_cast<unsigned long>(buttons));
       return;
     }
 
@@ -658,9 +670,9 @@ private:
       RCLCPP_WARN(
         get_logger(),
         "health: connected to %s but no joint data sent yet "
-        "(are the controllers publishing state?) | pongs=%lu dropped=%lu",
+        "(are the controllers publishing state?) | pongs=%lu dropped=%lu buttons_sent=%lu",
         server_text_.c_str(), static_cast<unsigned long>(pongs),
-        static_cast<unsigned long>(dropped));
+        static_cast<unsigned long>(dropped), static_cast<unsigned long>(buttons));
       return;
     }
 
@@ -670,17 +682,20 @@ private:
     if (since_send > kSendStaleThreshold) {
       RCLCPP_WARN(
         get_logger(),
-        "health: nothing sent for %lds (controller state stalled?) | sent=%lu dropped=%lu",
+        "health: nothing sent for %lds (controller state stalled?) "
+        "| sent=%lu dropped=%lu buttons_sent=%lu",
         static_cast<long>(
           std::chrono::duration_cast<std::chrono::seconds>(since_send).count()),
-        static_cast<unsigned long>(sent), static_cast<unsigned long>(dropped));
+        static_cast<unsigned long>(sent), static_cast<unsigned long>(dropped),
+        static_cast<unsigned long>(buttons));
       return;
     }
 
     RCLCPP_INFO(
-      get_logger(), "health: OK | server=%s sent=%lu pongs=%lu dropped=%lu",
+      get_logger(), "health: OK | server=%s sent=%lu pongs=%lu dropped=%lu buttons_sent=%lu",
       server_text_.c_str(), static_cast<unsigned long>(sent),
-      static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped));
+      static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped),
+      static_cast<unsigned long>(buttons));
   }
 
   transrecv_udp::UdpSocket & socket_;

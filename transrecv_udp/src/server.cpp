@@ -387,6 +387,10 @@ private:
   /// expecting a steady stream.
   void handle_buttons(const unsigned char * data, std::size_t length)
   {
+    // Counted here, before decode, so this reflects "a button-sized datagram
+    // reached the socket" -- independent of whether it then decodes cleanly.
+    buttons_received_.fetch_add(1, std::memory_order_relaxed);
+
     std::vector<std::uint8_t> buttons;
     std::string reason;
     if (!transrecv_udp::decode_button_packet(data, length, buttons, reason)) {
@@ -650,6 +654,8 @@ private:
     const std::uint64_t published = messages_published_.load(std::memory_order_relaxed);
     const std::uint64_t dropped = packets_dropped_.load(std::memory_order_relaxed);
     const std::uint64_t pongs = pongs_sent_.load(std::memory_order_relaxed);
+    const std::uint64_t buttons_in = buttons_received_.load(std::memory_order_relaxed);
+    const std::uint64_t buttons_out = buttons_published_.load(std::memory_order_relaxed);
 
     if (received == 0) {
       // last_receive_time_ is still its zero value here, so its age is
@@ -659,9 +665,10 @@ private:
       RCLCPP_WARN(
         get_logger(),
         "health: no joint data on port %u yet (client pings answered: %lu) "
-        "| published=%lu dropped=%lu",
+        "| published=%lu dropped=%lu buttons_received=%lu buttons_published=%lu",
         port_, static_cast<unsigned long>(pongs), static_cast<unsigned long>(published),
-        static_cast<unsigned long>(dropped));
+        static_cast<unsigned long>(dropped), static_cast<unsigned long>(buttons_in),
+        static_cast<unsigned long>(buttons_out));
       return;
     }
 
@@ -672,18 +679,23 @@ private:
       RCLCPP_WARN(
         get_logger(),
         "health: no datagram for %lds (client stalled?) "
-        "| received=%lu published=%lu pongs=%lu dropped=%lu",
+        "| received=%lu published=%lu pongs=%lu dropped=%lu buttons_received=%lu "
+        "buttons_published=%lu",
         static_cast<long>(
           std::chrono::duration_cast<std::chrono::seconds>(since_receive).count()),
         static_cast<unsigned long>(received), static_cast<unsigned long>(published),
-        static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped));
+        static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped),
+        static_cast<unsigned long>(buttons_in), static_cast<unsigned long>(buttons_out));
       return;
     }
 
     RCLCPP_INFO(
-      get_logger(), "health: OK | port=%u received=%lu published=%lu pongs=%lu dropped=%lu",
+      get_logger(),
+      "health: OK | port=%u received=%lu published=%lu pongs=%lu dropped=%lu "
+      "buttons_received=%lu buttons_published=%lu",
       port_, static_cast<unsigned long>(received), static_cast<unsigned long>(published),
-      static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped));
+      static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped),
+      static_cast<unsigned long>(buttons_in), static_cast<unsigned long>(buttons_out));
   }
 
   /// The newest controller state for one arm, waiting to be sent.
@@ -722,6 +734,7 @@ private:
   // Written by the send thread.
   std::atomic<std::uint64_t> states_sent_{0};
   // Written by the receive thread.
+  std::atomic<std::uint64_t> buttons_received_{0};
   std::atomic<std::uint64_t> buttons_published_{0};
 
   std::array<rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr, kNumArms>
