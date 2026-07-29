@@ -87,11 +87,16 @@ constexpr int kDataLogThrottleMs = 5000;
 // interval keeps every report built from the same amount of evidence, so the
 // numbers stay comparable when the stream speeds up or slows down.
 //
-// Receive and publish are measured over the same window on purpose: one publish
-// follows every accepted datagram, so the two rates match exactly unless a
-// packet was rejected. The gap between them is the drop rate, made visible
-// without having to diff two counters by hand.
+// Receive and publish are measured over the same window on purpose: a fixed
+// number of publishes follows every accepted datagram, so the two rates keep a
+// fixed ratio unless a packet was rejected. The gap is the drop rate, made
+// visible without having to diff two counters by hand.
 constexpr std::uint64_t kRateReportInterval = 10000;
+
+// How many trajectories one accepted datagram owes. A both-arms packet carries
+// the whole robot, so it publishes to both controllers.
+constexpr unsigned int kTrajectoriesPerSingleArmPacket = 1;
+constexpr unsigned int kTrajectoriesPerDualArmPacket = 2;
 
 // Guards the division below: a window this short means the clock is unusable
 // (or 100 datagrams genuinely arrived within a microsecond, which is not real).
@@ -272,7 +277,7 @@ private:
   /// rather than an executor timer so it can block instead of poll.
   void run_receive_loop()
   {
-    unsigned char buffer[sizeof(transrecv_udp::JointPacket) * 2];
+    unsigned char buffer[transrecv_udp::kReceiveBufferBytes];
 
     while (receive_running_.load(std::memory_order_relaxed)) {
       if (socket_fd_ < 0) {                                  // Rule 3: socket sanity
@@ -336,6 +341,15 @@ private:
       return;
     }
 
+    if (length == sizeof(transrecv_udp::DualJointPacket)) {
+      handle_dual_joint(data, length);
+      return;
+    }
+
+    // Single-arm JointPackets are no longer what the client sends -- arm
+    // commands arrive as DualJointPacket above. This path stays because the
+    // format is still what the server itself sends back as controller state,
+    // and rejecting it here would make a loopback setup silently confusing.
     transrecv_udp::DecodedPacket decoded;
     std::string reason;
     if (!transrecv_udp::decode_packet(data, length, decoded, reason)) {
@@ -350,7 +364,7 @@ private:
     last_receive_time_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
 
     publish_trajectory(decoded.arm, decoded.positions);
-    report_rates();
+    report_rates(kTrajectoriesPerSingleArmPacket);
 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), kDataLogThrottleMs,
@@ -360,13 +374,52 @@ private:
       decoded.positions[5], decoded.positions[6]);
   }
 
+  /// Decodes one both-arms datagram and publishes a trajectory for each side.
+  ///
+  /// The two publishes are not atomic -- ROS offers no way to make them so --
+  /// but they are back to back off one decoded packet, which is as close to
+  /// "both arms from the same instant" as this can get.
+  void handle_dual_joint(const unsigned char * data, std::size_t length)
+  {
+    transrecv_udp::ArmPositions left{};
+    transrecv_udp::ArmPositions right{};
+    std::string reason;
+    if (!transrecv_udp::decode_dual_packet(data, length, left, right, reason)) {
+      RCLCPP_WARN_THROTTLE(                                  // Rule 2: reject, don't guess
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "malformed both-arms datagram dropped: %s", reason.c_str());
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    packets_received_.fetch_add(1, std::memory_order_relaxed);
+    last_receive_time_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+
+    publish_trajectory(ArmSide::kLeft, std::vector<double>(left.begin(), left.end()));
+    publish_trajectory(ArmSide::kRight, std::vector<double>(right.begin(), right.end()));
+    report_rates(kTrajectoriesPerDualArmPacket);
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kDataLogThrottleMs,
+      "both arms received and published | left [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]"
+      " | right [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
+      left[0], left[1], left[2], left[3], left[4], left[5], left[6],
+      right[0], right[1], right[2], right[3], right[4], right[5], right[6]);
+  }
+
   /// Averages the receive and publish rates over the last kRateReportInterval
   /// datagrams and logs both, then starts a fresh window.
   ///
+  /// `expected` is how many trajectories this datagram should have produced --
+  /// two for a both-arms packet, one for a single-arm one. Without it the
+  /// shortfall below would be computed against the datagram count and a healthy
+  /// both-arms stream would report every window as broken.
+  ///
   /// Only ever called from the receive thread, which is also the only writer of
-  /// these three members, so they need no synchronisation.
-  void report_rates()
+  /// these members, so they need no synchronisation.
+  void report_rates(unsigned int expected)
   {
+    window_expected_ += expected;
     ++window_received_;
     if (window_received_ < kRateReportInterval) {
       return;
@@ -380,6 +433,7 @@ private:
       window_started_at_ = now;
       window_received_ = 0;
       window_published_ = 0;
+      window_expected_ = 0;
       RCLCPP_INFO(
         get_logger(), "rate: first %lu datagrams received, measuring from here",
         static_cast<unsigned long>(kRateReportInterval));
@@ -395,20 +449,23 @@ private:
       window_started_at_ = now;
       window_received_ = 0;
       window_published_ = 0;
+      window_expected_ = 0;
       return;
     }
 
     const double receive_hz = static_cast<double>(window_received_) / seconds;
     const double publish_hz = static_cast<double>(window_published_) / seconds;
 
-    if (window_published_ != window_received_) {             // Rule 2: the rates disagree
+    // Compared against what the datagrams asked for, not against how many there
+    // were: one both-arms datagram owes two trajectories.
+    if (window_published_ < window_expected_) {              // Rule 2: the rates disagree
       RCLCPP_WARN(
         get_logger(),
         "rate over %lu datagrams: recv %.1f Hz, push %.1f Hz "
-        "(%lu of %lu not published)",
+        "(%lu of %lu trajectories not published)",
         static_cast<unsigned long>(kRateReportInterval), receive_hz, publish_hz,
-        static_cast<unsigned long>(window_received_ - window_published_),
-        static_cast<unsigned long>(window_received_));
+        static_cast<unsigned long>(window_expected_ - window_published_),
+        static_cast<unsigned long>(window_expected_));
     } else {
       RCLCPP_INFO(
         get_logger(), "rate over %lu datagrams: recv %.1f Hz, push %.1f Hz",
@@ -418,6 +475,7 @@ private:
     window_started_at_ = now;
     window_received_ = 0;
     window_published_ = 0;
+    window_expected_ = 0;
   }
 
   /// Republishes VR button state received from the client.
@@ -892,10 +950,12 @@ private:
 
   // Rate-report window. Touched only by the receive thread, hence no atomics:
   // publish_trajectory() is called from there too, so window_published_ has a
-  // single writer like the other two.
+  // single writer like the others.
   std::chrono::steady_clock::time_point window_started_at_{};
   std::uint64_t window_received_ = 0;
   std::uint64_t window_published_ = 0;
+  // Trajectories the window's datagrams owed: two per both-arms packet.
+  std::uint64_t window_expected_ = 0;
 
   // Written by the executor thread (controller state callbacks).
   std::atomic<std::uint64_t> states_received_{0};

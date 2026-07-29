@@ -3,13 +3,17 @@
 #include <sys/socket.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -27,6 +31,7 @@
 
 namespace
 {
+using transrecv_udp::ArmPositions;
 using transrecv_udp::ArmSide;
 using transrecv_udp::kNumArmJoints;
 using transrecv_udp::kNumHandJoints;
@@ -87,6 +92,51 @@ constexpr std::chrono::milliseconds kPongTimeout{2000};
 // it can go without noticing a stop request.
 constexpr std::chrono::milliseconds kReceiveTimeout{200};
 
+// --- Send queue -------------------------------------------------------------
+// Arm commands are handed to a sender thread instead of leaving from inside the
+// subscription callback. The callback runs on the executor, so a send() that
+// blocks there stalls every other subscription on this node with it; a queue
+// plus one thread keeps the socket's latency off the ROS side entirely.
+//
+// One queue per arm: the two arms arrive as separate topics at rates nobody
+// coordinates, and a burst on one must not push the other's commands out of a
+// buffer they share. They are recombined at the last moment, into one datagram
+// carrying both.
+
+// Bounded on purpose. A joint command is only worth sending while it is fresh,
+// so an overflow drops the OLDEST entry rather than refusing the newest: the
+// arm should end up at the most recent commanded pose, and a queue that grows
+// without limit would just keep widening the lag to it.
+//
+// This bounds a burst, not an outage: while the link is down the sender still
+// pops and discards, so nothing accumulates to be replayed on reconnect.
+constexpr std::size_t kSendQueueDepth = 64;
+
+// The sender parks on a condition variable. This bound is only how long it can
+// go without noticing a stop request.
+constexpr std::chrono::milliseconds kSendIdleTimeout{200};
+
+/// One arm's pending commands.
+struct JointCommandQueue
+{
+  std::deque<ArmPositions> items;
+};
+
+// One mutex and one condition variable for both queues: a single sender thread
+// cannot wait on two condition variables at once. The critical section is only
+// ever a push or a pop -- never a send -- so the two arms do not contend for it
+// in any meaningful way.
+std::mutex g_queue_mutex;
+std::condition_variable g_queue_cv;
+JointCommandQueue g_left_queue;
+JointCommandQueue g_right_queue;
+
+/// Picks the queue for `side`. The caller must already hold g_queue_mutex.
+JointCommandQueue & queue_for(ArmSide side)
+{
+  return side == ArmSide::kLeft ? g_left_queue : g_right_queue;
+}
+
 constexpr std::chrono::milliseconds kHealthCheckPeriod{5000};
 constexpr std::chrono::seconds kSendStaleThreshold{2};
 
@@ -110,15 +160,28 @@ std::optional<std::uint16_t> parse_port(const std::string & text)
 
 /// Sending end of the UDP link.
 ///
-/// Subscribes to both arms' controller state and pushes the measured joint
-/// positions to the server, which republishes them as commands.
+/// Subscribes to what the local bridge publishes -- arm and hand trajectory
+/// commands, VR buttons, FK end-effector poses -- and mirrors each to the
+/// server. The one thing it publishes locally is the arm controller state the
+/// server pushes back.
 ///
-/// Three threads beside the executor, each with one job:
+/// Both arms leave in a single datagram. They arrive as two topics at rates
+/// nobody coordinates, so each side is queued separately and recombined by the
+/// send thread; a side with nothing new has its last value repeated, so every
+/// datagram states the whole robot's pose rather than half of it.
+///
+/// Four threads beside the executor, each with one job:
+///   send       -- drains the two arm command queues into one both-arms
+///                 datagram, so a slow socket never blocks a subscription
 ///   connection -- pings the server every 500 ms and declares the link down
 ///                 when the answers stop
 ///   receive    -- parks in recv() waiting for those answers
 ///   health     -- periodic self-report, separate so a stalled send path is
 ///                 still reported by a thread that did not stall
+///
+/// Only arm commands are queued. Buttons are already rate-limited to one
+/// datagram per press, and poses/hand commands are sent straight from their
+/// callbacks -- adding a queue there would buy nothing.
 ///
 /// The ping/pong is the whole point: connect() on a datagram socket sends
 /// nothing and cannot fail, so without an answer from the far end the client
@@ -231,6 +294,11 @@ public:
     receive_thread_ = std::thread([this]() { run_receive_loop(); });
     RCLCPP_INFO(get_logger(), "receive thread started");
 
+    send_running_.store(true, std::memory_order_relaxed);
+    send_thread_ = std::thread([this]() { run_send_loop(); });
+    RCLCPP_INFO(
+      get_logger(), "send thread started (one queue per arm, depth %zu)", kSendQueueDepth);
+
     connection_thread_.start();
     health_thread_.start();
   }
@@ -240,6 +308,7 @@ public:
   {
     health_thread_.stop();
     connection_thread_.stop();
+    stop_send_thread();
 
     if (!receive_thread_.joinable()) {
       return;
@@ -329,7 +398,7 @@ private:
   /// block instead of poll, and so nothing else has to wait on it.
   void run_receive_loop()
   {
-    unsigned char buffer[sizeof(transrecv_udp::JointPacket) * 2];
+    unsigned char buffer[transrecv_udp::kReceiveBufferBytes];
 
     while (receive_running_.load(std::memory_order_relaxed)) {
       if (!socket_.valid()) {                                // Rule 3: socket sanity
@@ -440,24 +509,166 @@ private:
     // matching what the bridge writes on this same topic.
     const std::vector<double> positions(commanded.begin(), commanded.begin() + kNumArmJoints);
 
-    if (!send_packet(side, positions)) {
-      return;
-    }
+    // The callback's job ends here. Whether the datagram actually goes out is
+    // the sender thread's problem, and it logs that separately.
+    enqueue_joint_command(side, positions);
 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), kLogThrottleMs,
-      "[%s] sent: [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
+      "[%s] queued: [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
       transrecv_udp::to_string(side), positions[0], positions[1], positions[2],
       positions[3], positions[4], positions[5], positions[6]);
   }
 
-  /// Single send path, so every failure is counted and logged one way.
-  bool send_packet(ArmSide side, const std::vector<double> & positions)
+  /// Puts one arm's positions on its queue. Runs on the executor thread, so it
+  /// must never touch the socket.
+  void enqueue_joint_command(ArmSide side, const std::vector<double> & positions)
+  {
+    if (positions.size() != kNumArmJoints) {                 // Rule 3: size guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] %zu positions, expected %zu, not queuing",
+        transrecv_udp::to_string(side), positions.size(), kNumArmJoints);
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    ArmPositions entry{};
+    std::copy(positions.begin(), positions.end(), entry.begin());
+
+    bool overflowed = false;
+    {
+      const std::lock_guard<std::mutex> lock(g_queue_mutex);
+      JointCommandQueue & queue = queue_for(side);
+
+      if (queue.items.size() >= kSendQueueDepth) {           // Rule 3: bound the queue
+        queue.items.pop_front();                             // oldest is the least useful
+        overflowed = true;
+      }
+      queue.items.push_back(entry);
+    }
+    g_queue_cv.notify_one();
+
+    if (overflowed) {                                        // Rule 2: say what was lost
+      queue_dropped_.fetch_add(1, std::memory_order_relaxed);
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s] send queue full at %zu, dropped the oldest command "
+        "(commands arriving faster than the socket drains them)",
+        transrecv_udp::to_string(side), kSendQueueDepth);
+    }
+  }
+
+  /// Drains both queues and puts one both-arms datagram on the wire per pass.
+  /// Its own thread so a send that blocks delays nothing but the next send.
+  ///
+  /// An arm with nothing queued this pass is not skipped -- its last known
+  /// positions are repeated, so every datagram states where the whole robot
+  /// should be rather than leaving the far end to remember half of it.
+  void run_send_loop()
+  {
+    while (send_running_.load(std::memory_order_relaxed)) {
+      bool left_fresh = false;
+      bool right_fresh = false;
+
+      {
+        std::unique_lock<std::mutex> lock(g_queue_mutex);
+        g_queue_cv.wait_for(
+          lock, kSendIdleTimeout,
+          [this]() {
+            return !g_left_queue.items.empty() || !g_right_queue.items.empty() ||
+                   !send_running_.load(std::memory_order_relaxed);
+          });
+
+        if (!send_running_.load(std::memory_order_relaxed)) {   // Rule 2: log the exit
+          RCLCPP_INFO(get_logger(), "send thread: stop requested, exiting");
+          return;
+        }
+
+        // One from each side per pass, so a fast arm cannot starve the other.
+        // Whatever is popped replaces the cached value; whatever is not stays
+        // as it was and gets repeated below.
+        if (!g_left_queue.items.empty()) {
+          last_left_ = g_left_queue.items.front();
+          g_left_queue.items.pop_front();
+          left_fresh = true;
+          have_left_ = true;
+        }
+        if (!g_right_queue.items.empty()) {
+          last_right_ = g_right_queue.items.front();
+          g_right_queue.items.pop_front();
+          right_fresh = true;
+          have_right_ = true;
+        }
+      }
+
+      // Both queues were empty: the wait timed out on its way to re-checking
+      // the stop flag, which is not a reason to send anything.
+      if (!left_fresh && !right_fresh) {
+        continue;
+      }
+
+      // Rule 3: an arm that has never published has no old value to repeat, and
+      // a default-constructed one is not "unknown" on the wire -- it is a valid
+      // command to drive that arm to zero. Nothing goes out until both sides
+      // have been heard from at least once.
+      if (!have_left_ || !have_right_) {                     // Rule 2: say what is missing
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), kLogThrottleMs,
+          "waiting for the %s arm's first command before sending "
+          "(a both-arms packet cannot invent the side it has never seen)",
+          have_left_ ? "right" : "left");
+        continue;
+      }
+
+      // Outside the lock: the callbacks filling these queues must never wait on
+      // a syscall.
+      send_dual_packet(left_fresh, right_fresh);
+    }
+  }
+
+  /// Signals the sender, joins it, and throws away whatever it never got to.
+  void stop_send_thread()
+  {
+    if (!send_thread_.joinable()) {
+      return;
+    }
+
+    {
+      // Set under the lock: a sender that has already evaluated the wait
+      // predicate would otherwise sleep through the notify below.
+      const std::lock_guard<std::mutex> lock(g_queue_mutex);
+      send_running_.store(false, std::memory_order_relaxed);
+    }
+    g_queue_cv.notify_all();
+    send_thread_.join();
+
+    const std::lock_guard<std::mutex> lock(g_queue_mutex);
+    const std::size_t left = g_left_queue.items.size();
+    const std::size_t right = g_right_queue.items.size();
+    if (left > 0 || right > 0) {                             // Rule 2: say what was discarded
+      RCLCPP_WARN(
+        get_logger(), "send thread stopped with %zu left and %zu right commands unsent",
+        left, right);
+    }
+
+    // Nothing here will ever be acted on, and leaving it would let a restart
+    // replay poses the arm has long since moved past.
+    g_left_queue.items.clear();
+    g_right_queue.items.clear();
+  }
+
+  /// Single send path for arm commands, so every failure is counted and logged
+  /// one way. Runs on the sender thread, and reads the cached positions that
+  /// only that thread ever writes.
+  ///
+  /// `left_fresh`/`right_fresh` say which sides came off a queue this pass; the
+  /// other side is being repeated, which the log spells out so a stalled topic
+  /// is not mistaken for a healthy one.
+  bool send_dual_packet(bool left_fresh, bool right_fresh)
   {
     if (!socket_.valid()) {                                  // Rule 3: use-before-init
       RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), kLogThrottleMs,
-        "[%s] socket not open, cannot send", transrecv_udp::to_string(side));
+        get_logger(), *get_clock(), kLogThrottleMs, "socket not open, cannot send");
       packets_dropped_.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
@@ -465,17 +676,21 @@ private:
     if (!connected_.load(std::memory_order_relaxed)) {       // Rule 2: waiting on the retry
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), kLogThrottleMs,
-        "[%s] not connected to %s, dropping state",
-        transrecv_udp::to_string(side), server_text_.c_str());
+        "not connected to %s, dropping command", server_text_.c_str());
       packets_dropped_.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
 
-    const transrecv_udp::JointPacket packet = transrecv_udp::make_packet(side, positions);
+    const transrecv_udp::DualJointPacket packet =
+      transrecv_udp::make_dual_packet(last_left_, last_right_);
 
-    // send(), not sendto(): the peer is fixed by connect(), which is also what
-    // makes ECONNREFUSED reach us here.
-    const ssize_t sent = send(socket_.get(), &packet, sizeof(packet), 0);
+    // sendto() with the address main() resolved, so the destination is stated
+    // on the datagram itself instead of being inherited from connect(). Linux
+    // permits that on a connected socket; connect() stays because it is what
+    // lets the receive thread use recv() and what routes ECONNREFUSED back.
+    const ssize_t sent = sendto(
+      socket_.get(), &packet, sizeof(packet), 0,
+      reinterpret_cast<const sockaddr *>(&server_), sizeof(server_));
 
     if (sent < 0) {
       if (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EHOSTUNREACH) {
@@ -483,7 +698,7 @@ private:
       } else {
         RCLCPP_WARN_THROTTLE(                                // Rule 2: log the failure path
           get_logger(), *get_clock(), kLogThrottleMs,
-          "[%s] send() failed: %s", transrecv_udp::to_string(side), std::strerror(errno));
+          "sendto() failed: %s", std::strerror(errno));
       }
       packets_dropped_.fetch_add(1, std::memory_order_relaxed);
       return false;
@@ -492,14 +707,27 @@ private:
     if (static_cast<std::size_t>(sent) != sizeof(packet)) {   // Rule 3: short-write guard
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), kLogThrottleMs,
-        "[%s] short send: %zd of %zu bytes", transrecv_udp::to_string(side), sent,
-        sizeof(packet));
+        "short send: %zd of %zu bytes", sent, sizeof(packet));
       packets_dropped_.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
 
     packets_sent_.fetch_add(1, std::memory_order_relaxed);
     last_send_time_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+    if (!left_fresh || !right_fresh) {
+      repeated_sides_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kLogThrottleMs,
+      "sent both arms | left%s [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]"
+      " | right%s [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
+      left_fresh ? "" : " (repeated)",
+      last_left_[0], last_left_[1], last_left_[2], last_left_[3], last_left_[4],
+      last_left_[5], last_left_[6],
+      right_fresh ? "" : " (repeated)",
+      last_right_[0], last_right_[1], last_right_[2], last_right_[3], last_right_[4],
+      last_right_[5], last_right_[6]);
     return true;
   }
 
@@ -868,15 +1096,21 @@ private:
     const std::uint64_t poses = poses_sent_.load(std::memory_order_relaxed);
     const std::uint64_t hands = hands_sent_.load(std::memory_order_relaxed);
 
+    // Appended to every branch below, so the queue state is visible whichever
+    // one is taken instead of being repeated in four format strings. A backlog
+    // that never drains is the symptom that says the sender thread, not the
+    // network, is the problem.
+    const std::string queue_text = describe_queues();
+
     if (!connected_.load(std::memory_order_relaxed)) {       // Rule 2: state-dependent branch
       RCLCPP_WARN(
         get_logger(),
         "health: not connected to %s | pings=%lu pongs=%lu dropped=%lu buttons_sent=%lu "
-        "poses_sent=%lu hands_sent=%lu",
+        "poses_sent=%lu hands_sent=%lu %s",
         server_text_.c_str(), static_cast<unsigned long>(pings),
         static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped),
         static_cast<unsigned long>(buttons), static_cast<unsigned long>(poses),
-        static_cast<unsigned long>(hands));
+        static_cast<unsigned long>(hands), queue_text.c_str());
       return;
     }
 
@@ -887,10 +1121,11 @@ private:
         get_logger(),
         "health: connected to %s but no joint data sent yet "
         "(are the controllers publishing state?) | pongs=%lu dropped=%lu buttons_sent=%lu "
-        "poses_sent=%lu hands_sent=%lu",
+        "poses_sent=%lu hands_sent=%lu %s",
         server_text_.c_str(), static_cast<unsigned long>(pongs),
         static_cast<unsigned long>(dropped), static_cast<unsigned long>(buttons),
-        static_cast<unsigned long>(poses), static_cast<unsigned long>(hands));
+        static_cast<unsigned long>(poses), static_cast<unsigned long>(hands),
+        queue_text.c_str());
       return;
     }
 
@@ -901,23 +1136,40 @@ private:
       RCLCPP_WARN(
         get_logger(),
         "health: nothing sent for %lds (controller state stalled?) "
-        "| sent=%lu dropped=%lu buttons_sent=%lu poses_sent=%lu hands_sent=%lu",
+        "| sent=%lu dropped=%lu buttons_sent=%lu poses_sent=%lu hands_sent=%lu %s",
         static_cast<long>(
           std::chrono::duration_cast<std::chrono::seconds>(since_send).count()),
         static_cast<unsigned long>(sent), static_cast<unsigned long>(dropped),
         static_cast<unsigned long>(buttons), static_cast<unsigned long>(poses),
-        static_cast<unsigned long>(hands));
+        static_cast<unsigned long>(hands), queue_text.c_str());
       return;
     }
 
     RCLCPP_INFO(
       get_logger(),
       "health: OK | server=%s sent=%lu pongs=%lu dropped=%lu buttons_sent=%lu "
-      "poses_sent=%lu hands_sent=%lu",
+      "poses_sent=%lu hands_sent=%lu %s",
       server_text_.c_str(), static_cast<unsigned long>(sent),
       static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped),
       static_cast<unsigned long>(buttons), static_cast<unsigned long>(poses),
-      static_cast<unsigned long>(hands));
+      static_cast<unsigned long>(hands), queue_text.c_str());
+  }
+
+  /// Snapshot of both queues, for the health line.
+  std::string describe_queues() const
+  {
+    std::size_t left = 0;
+    std::size_t right = 0;
+    {
+      const std::lock_guard<std::mutex> lock(g_queue_mutex);
+      left = g_left_queue.items.size();
+      right = g_right_queue.items.size();
+    }
+
+    return "queued=" + std::to_string(left) + "/" + std::to_string(right) +
+           " (max " + std::to_string(kSendQueueDepth) + ") queue_dropped=" +
+           std::to_string(queue_dropped_.load(std::memory_order_relaxed)) +
+           " repeated=" + std::to_string(repeated_sides_.load(std::memory_order_relaxed));
   }
 
   transrecv_udp::UdpSocket & socket_;
@@ -940,6 +1192,23 @@ private:
   std::atomic<std::uint64_t> poses_sent_{0};
   std::atomic<std::uint64_t> hands_sent_{0};
 
+  // Separate from packets_dropped_: a queue overflow means the client could not
+  // keep up or the link was down, which is a different problem from a malformed
+  // message being rejected.
+  std::atomic<std::uint64_t> queue_dropped_{0};
+
+  // Datagrams where at least one side was a repeat. A number that tracks
+  // packets_sent_ means one of the two topics has stopped publishing.
+  std::atomic<std::uint64_t> repeated_sides_{0};
+
+  // The last positions seen for each arm, repeated into any datagram where that
+  // side had nothing queued. Written and read only by the send thread, so no
+  // atomic and no lock -- the queue mutex covers the pop, not these.
+  ArmPositions last_left_{};
+  ArmPositions last_right_{};
+  bool have_left_ = false;
+  bool have_right_ = false;
+
   // Touched only by the executor thread (the Joy callback), so no atomic and no
   // lock: the send path for buttons runs entirely inside that callback.
   std::vector<std::uint8_t> last_buttons_sent_;
@@ -958,6 +1227,9 @@ private:
 
   std::thread receive_thread_;
   std::atomic<bool> receive_running_{false};
+
+  std::thread send_thread_;
+  std::atomic<bool> send_running_{false};
 
   // Declared last on purpose: members are destroyed in reverse order, so these
   // destructors join their threads before the state those threads read.

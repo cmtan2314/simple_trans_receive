@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -29,10 +30,15 @@ namespace transrecv_udp
 /// Every packet type has a different fixed size, so a datagram is classified by
 /// length before anything is decoded, and a wrong-sized one is rejected on size
 /// alone: ControlPacket 8, ButtonPacket 12, PosePacket 36, HandJointPacket 56,
-/// JointPacket 64. The static_asserts below enforce that they stay distinct.
+/// JointPacket 64, DualJointPacket 116. The static_asserts below enforce that
+/// they stay distinct.
 
 // Each arm is a 7-DOF OpenArm. Single source of truth for every buffer size.
 constexpr std::size_t kNumArmJoints = 7;
+
+/// One arm's joint positions. Fixed size and trivially copyable, so it can sit
+/// in a queue or be cached without allocating.
+using ArmPositions = std::array<double, kNumArmJoints>;
 
 // Marks our datagrams so a stray packet on the port is never decoded as a pose.
 constexpr std::uint32_t kPacketMagic = 0x4F41524Du;  // "OARM"
@@ -81,6 +87,75 @@ inline JointPacket make_packet(ArmSide arm, const std::vector<double> & position
     std::memcpy(packet.positions, positions.data(), sizeof(packet.positions));
   }
   return packet;
+}
+
+// --- Both arms in one datagram ----------------------------------------------
+// The client sends arm commands as this, not as two JointPackets.
+//
+// Two separate datagrams for one instant of a two-armed robot can be reordered,
+// spaced apart, or have exactly one of them lost -- and the far end has no way
+// to tell that it is acting on a half-updated pose. One datagram carrying both
+// sides makes that impossible to express: the arms either both move or neither
+// does. It also halves the packet rate.
+//
+// There is no `arm` field, because a packet is never about one arm.
+#pragma pack(push, 1)
+struct DualJointPacket
+{
+  std::uint32_t magic;
+  double left[kNumArmJoints];
+  double right[kNumArmJoints];
+};
+#pragma pack(pop)
+
+constexpr std::size_t kDualJointPacketBytes =
+  sizeof(std::uint32_t) + sizeof(double) * kNumArmJoints * 2;
+static_assert(
+  sizeof(DualJointPacket) == kDualJointPacketBytes,
+  "DualJointPacket must be tightly packed for the wire format");
+static_assert(
+  sizeof(DualJointPacket) != sizeof(JointPacket),
+  "the two packet types must differ in size, that is how they are told apart");
+
+/// Fills a packet with both arms at once. Neither side is optional: the sender
+/// repeats its last known value for an arm that has nothing new, so that the
+/// packet always describes the whole robot.
+inline DualJointPacket make_dual_packet(const ArmPositions & left, const ArmPositions & right)
+{
+  DualJointPacket packet{};
+  packet.magic = htonl(kPacketMagic);
+  std::memcpy(packet.left, left.data(), sizeof(packet.left));
+  std::memcpy(packet.right, right.data(), sizeof(packet.right));
+  return packet;
+}
+
+/// Validates and decodes a both-arms datagram. Returns false (with `reason` for
+/// the caller to log) on wrong size or bad magic. Never partially fills `out`.
+inline bool decode_dual_packet(
+  const void * data, std::size_t length, ArmPositions & left_out, ArmPositions & right_out,
+  std::string & reason)
+{
+  if (data == nullptr) {                            // Rule 3: null guard
+    reason = "null buffer";
+    return false;
+  }
+
+  if (length != sizeof(DualJointPacket)) {          // Rule 3: size guard
+    reason = "size " + std::to_string(length) + " != " + std::to_string(sizeof(DualJointPacket));
+    return false;
+  }
+
+  DualJointPacket packet{};
+  std::memcpy(&packet, data, sizeof(packet));
+
+  if (ntohl(packet.magic) != kPacketMagic) {        // Rule 3: not ours
+    reason = "bad magic";
+    return false;
+  }
+
+  std::memcpy(left_out.data(), packet.left, sizeof(packet.left));
+  std::memcpy(right_out.data(), packet.right, sizeof(packet.right));
+  return true;
 }
 
 /// The liveness exchange. Deliberately a different size from JointPacket so the
@@ -460,6 +535,34 @@ inline std::vector<std::string> hand_joint_names(ArmSide side)
   }
   return names;
 }
+
+// --- Receive buffer ----------------------------------------------------------
+// DualJointPacket is declared before the types below it, so its distinctness
+// from them can only be checked here, once every type exists.
+static_assert(
+  sizeof(DualJointPacket) != sizeof(ControlPacket) &&
+  sizeof(DualJointPacket) != sizeof(ButtonPacket) &&
+  sizeof(DualJointPacket) != sizeof(PosePacket) &&
+  sizeof(DualJointPacket) != sizeof(HandJointPacket),
+  "every packet type must have a distinct size, that is how they are told apart");
+
+constexpr std::size_t kMaxPacketBytes = sizeof(DualJointPacket);
+static_assert(
+  kMaxPacketBytes >= sizeof(JointPacket) &&
+  kMaxPacketBytes >= sizeof(HandJointPacket) &&
+  kMaxPacketBytes >= sizeof(PosePacket) &&
+  kMaxPacketBytes >= sizeof(ButtonPacket) &&
+  kMaxPacketBytes >= sizeof(ControlPacket),
+  "kMaxPacketBytes must name the largest packet type, or recv() would truncate it");
+
+/// Size for any recv() buffer on this protocol.
+///
+/// One byte larger than the largest packet on purpose: recv() silently
+/// truncates a datagram to the buffer, so a buffer of exactly kMaxPacketBytes
+/// would hand an oversized datagram back at exactly the length of a valid
+/// packet, and it would be decoded as one. The extra byte makes an oversized
+/// datagram come back at a length no type has, so it is rejected on size alone.
+constexpr std::size_t kReceiveBufferBytes = kMaxPacketBytes + 1;
 
 }  // namespace transrecv_udp
 
