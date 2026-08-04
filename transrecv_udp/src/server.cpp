@@ -9,7 +9,9 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <algorithm>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -95,6 +97,13 @@ constexpr std::uint16_t kMinUserPort = 1024;
 // against wakeups: 200 ms is imperceptible on exit and idles at 5 wakeups/s.
 constexpr std::chrono::milliseconds kReceiveTimeout{200};
 
+// One sample larger than the largest datagram we accept, on purpose: recvfrom()
+// truncates silently, so a datagram too big to be a batch fills the buffer
+// exactly and that length is rejected, instead of a truncated tail being decoded
+// as a shorter batch that happens to fit.
+constexpr std::size_t kReceiveBufferBytes =
+  sizeof(transrecv_udp::JointBatchPacket) + sizeof(transrecv_udp::JointSample);
+
 // --- Send thread ------------------------------------------------------------
 // The controller state subscribed to above is pushed to the client on its own
 // thread, on its own clock: the ROS callbacks that supply it and the socket
@@ -106,6 +115,44 @@ constexpr std::chrono::milliseconds kReceiveTimeout{200};
 // the wire rate stays put when the controller rate wobbles; the cost is that a
 // pose can be repeated, or one skipped, when the two clocks disagree.
 constexpr std::chrono::milliseconds kStateSendPeriod{10};
+
+// --- Publish thread ---------------------------------------------------------
+// Arm samples arrive batched: one datagram carries everything the client
+// collected since its last tick. The receive thread only decodes and appends
+// them, and the publish thread walks that vector one sample at a time.
+//
+// This period paces each SAMPLE, not each drain. A batch of 24 that arrived in
+// one datagram leaves the node one pose at a time instead of 24 in one instant
+// -- the arm gets back the cadence the client recorded, not the shape the
+// network happened to deliver it in.
+//
+// Splitting receive from publish also keeps the receive thread back in recv()
+// as fast as possible: publishing from there would leave the socket unattended
+// for the whole batch, which is how a burst turns into a dropped datagram.
+//
+// The rate is therefore also a throughput ceiling, and it is set ABOVE the
+// source. The source runs at about 500 Hz; publishing at 500 too would leave
+// zero margin, and with zero margin a backlog never shrinks -- one stall would
+// put the arm permanently behind by however long the stall lasted. The 100 Hz
+// of surplus is what pays a backlog back: it drains at (rate - source) samples
+// per second, so a stall of T seconds takes 5T to work off.
+//
+// Milliseconds cannot express 600 Hz (1.667 ms), hence microseconds.
+constexpr int kPublishRateHz = 600;
+constexpr std::chrono::microseconds kPublishPeriod{1000000 / kPublishRateHz};
+
+// The received-but-not-yet-published vector has no ceiling, for the same reason
+// the client's does not: capping it would mean dropping samples out of the
+// middle of a trajectory, and a missing middle is what the arm feels as a jump.
+// It grows instead, so a stalled publish thread costs latency, not a
+// discontinuity. Passing this mark earns a warning and nothing more.
+constexpr std::size_t kPendingHighWater = 500;
+
+// --- Loop rate report -------------------------------------------------------
+// The publish thread times itself and logs on this period. Same cadence as the
+// health check on purpose: the two lines land together, so one glance shows both
+// what the thread managed and what it carried.
+constexpr double kRateReportSeconds = 5.0;
 
 // --- Health monitor ---------------------------------------------------------
 constexpr std::chrono::milliseconds kHealthCheckPeriod{5000};
@@ -136,16 +183,30 @@ std::size_t arm_index(ArmSide side)
 
 /// Receiving end of the UDP link.
 ///
-/// Two threads:
-///   receive -- parks in recv(), decodes each datagram and publishes it right
-///              there; answers pings with a pong
+/// Arm commands arrive batched: one datagram carries every sample the client
+/// collected since its last tick. The receive thread decodes a datagram onto a
+/// vector and goes straight back to recv(); the publish thread takes that whole
+/// vector and walks it one sample per publish slot. Nothing between the socket and
+/// topics can stall the socket, which is the point -- an unattended socket is
+/// how a burst turns into a lost datagram.
+///
+/// The output is a steady 600 Hz whatever the network did: a batch is spread
+/// back out over time rather than dumped at once, and a slot with nothing left
+/// to publish repeats the pose the arm was last given. So the topics never fall
+/// silent and never burst -- if the client stops sending, the arms are told to
+/// hold where they are rather than told nothing.
+///
+/// The cost is latency: a sample waits behind every sample still queued ahead
+/// of it, one slot each. Order is preserved and nothing is interpolated.
+///
+/// Four threads:
+///   receive -- parks in recv(), decodes each datagram onto the pending vector;
+///              answers pings with a pong
+///   publish -- walks that vector onto the trajectory topics, one per slot
+///   send    -- pushes local controller state back to the client
 ///   health  -- periodic self-report, on its own thread on purpose: a watchdog
 ///              that shares a thread with the work it watches cannot report a
 ///              stall in that work
-///
-/// Publishing straight from the receive thread means the output rate is exactly
-/// the input rate: no buffering, no repeating, and no added latency beyond the
-/// decode. If the client stops sending, the topic simply goes quiet.
 class TrajectoryServer : public rclcpp::Node
 {
 public:
@@ -164,6 +225,13 @@ public:
       RCLCPP_ERROR(get_logger(), "constructed with an invalid socket fd %d", socket_fd_);
       throw std::invalid_argument("TrajectoryServer needs a bound socket");
     }
+
+    joint_names_[arm_index(ArmSide::kLeft)] = transrecv_udp::arm_joint_names(ArmSide::kLeft);
+    joint_names_[arm_index(ArmSide::kRight)] = transrecv_udp::arm_joint_names(ArmSide::kRight);
+
+    pending_.reserve(kPendingHighWater);
+    publish_buffer_.reserve(kPendingHighWater);
+    decoded_.reserve(transrecv_udp::kMaxSamplesPerDatagram);
 
     const rclcpp::QoS qos = rclcpp::QoS(kTrajectoryQueueDepth).reliable();
     publishers_[arm_index(ArmSide::kLeft)] =
@@ -193,6 +261,12 @@ public:
       get_logger(), "subscribed to '%s' and '%s' (depth %zu, reliable)",
       kLeftControllerStateTopic, kRightControllerStateTopic, kStateQueueDepth);
     RCLCPP_INFO(
+      get_logger(),
+      "batched arm commands: publishing one sample every %ldus (%d Hz), up to %zu samples "
+      "per datagram, unbounded buffer (warns past %zu)",
+      static_cast<long>(kPublishPeriod.count()), kPublishRateHz,
+      transrecv_udp::kMaxSamplesPerDatagram, kPendingHighWater);
+    RCLCPP_INFO(
       get_logger(), "pushing controller state to %s every %ldms",
       client_text_.c_str(), static_cast<long>(kStateSendPeriod.count()));
     RCLCPP_INFO(get_logger(), "waiting for client datagrams on port %u", port_);
@@ -216,15 +290,25 @@ public:
     receive_thread_ = std::thread([this]() { run_receive_loop(); });
     RCLCPP_INFO(get_logger(), "receive thread started");
 
+    publish_running_.store(true, std::memory_order_relaxed);
+    publish_thread_ = std::thread([this]() { run_publish_loop(); });
+    RCLCPP_INFO(get_logger(), "publish thread started");
+
     send_thread_.start();
     health_thread_.start();
   }
 
-  /// Stops both threads and joins them. Safe to call twice.
+  /// Stops every thread and joins them. Safe to call twice.
   void stop()
   {
     health_thread_.stop();
     send_thread_.stop();
+
+    if (publish_thread_.joinable()) {
+      publish_running_.store(false, std::memory_order_relaxed);
+      publish_thread_.join();          // wakes within one slot at the latest
+      RCLCPP_INFO(get_logger(), "publish thread stopped");
+    }
 
     if (!receive_thread_.joinable()) {
       return;
@@ -241,7 +325,7 @@ private:
   /// rather than an executor timer so it can block instead of poll.
   void run_receive_loop()
   {
-    unsigned char buffer[sizeof(transrecv_udp::JointPacket) * 2];
+    unsigned char buffer[kReceiveBufferBytes];
 
     while (receive_running_.load(std::memory_order_relaxed)) {
       if (socket_fd_ < 0) {                                  // Rule 3: socket sanity
@@ -295,6 +379,54 @@ private:
       return;
     }
 
+    if (length == sizeof(transrecv_udp::JointPacket)) {
+      handle_single_joint(data, length);
+      return;
+    }
+
+    handle_joint_batch(data, length);
+  }
+
+  /// The batched arm stream: decode straight onto the pending vector and get
+  /// back to recv(). Publishing is the publish thread's job.
+  void handle_joint_batch(const unsigned char * data, std::size_t length)
+  {
+    // decode_ scratch, reused every datagram: this runs at the client's send
+    // rate and a fresh vector per datagram would allocate at that rate.
+    decoded_.clear();
+
+    std::string reason;
+    if (!transrecv_udp::decode_joint_batch(data, length, decoded_, reason)) {
+      RCLCPP_WARN_THROTTLE(                                  // Rule 2: reject, don't guess
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "malformed datagram dropped: %s", reason.c_str());
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    if (decoded_.empty()) {                                  // Rule 3: decoder promises >= 1
+      RCLCPP_ERROR(get_logger(), "decoder accepted a datagram but produced no samples");
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    packets_received_.fetch_add(1, std::memory_order_relaxed);
+    accept_samples(decoded_);
+
+    const transrecv_udp::ArmSample & last = decoded_.back();
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kDataLogThrottleMs,
+      "batch of %zu received, newest [%s]: [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
+      decoded_.size(), transrecv_udp::to_string(last.arm), last.positions[0],
+      last.positions[1], last.positions[2], last.positions[3], last.positions[4],
+      last.positions[5], last.positions[6]);
+  }
+
+  /// A single-sample datagram, the pre-batch wire format. Still accepted so an
+  /// older client keeps working, and it joins the same vector so both formats
+  /// reach the topics through one path in arrival order.
+  void handle_single_joint(const unsigned char * data, std::size_t length)
+  {
     transrecv_udp::DecodedPacket decoded;
     std::string reason;
     if (!transrecv_udp::decode_packet(data, length, decoded, reason)) {
@@ -305,42 +437,77 @@ private:
       return;
     }
 
+    if (decoded.positions.size() != kNumArmJoints) {         // Rule 3: size guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s] decoded %zu positions, expected %zu, dropping",
+        transrecv_udp::to_string(decoded.arm), decoded.positions.size(), kNumArmJoints);
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
     packets_received_.fetch_add(1, std::memory_order_relaxed);
+
+    decoded_.clear();
+    transrecv_udp::ArmSample sample;
+    sample.arm = decoded.arm;
+    std::copy(decoded.positions.begin(), decoded.positions.end(), sample.positions.begin());
+    decoded_.push_back(sample);
+
+    accept_samples(decoded_);
+  }
+
+  /// Appends a decoded datagram's samples to the pending vector. Nothing is ever
+  /// discarded here -- the publish thread is what empties it.
+  void accept_samples(const std::vector<transrecv_udp::ArmSample> & samples)
+  {
+    if (samples.empty()) {                                   // Rule 3: nothing to append
+      return;
+    }
+
     last_receive_time_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+    samples_received_.fetch_add(samples.size(), std::memory_order_relaxed);
 
-    publish_trajectory(decoded.arm, decoded.positions);
-    report_rates();
+    std::size_t pending = 0;
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      pending_.insert(pending_.end(), samples.begin(), samples.end());
+      pending = pending_.size();
+    }
 
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), kDataLogThrottleMs,
-      "[%s] received and published: [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
-      transrecv_udp::to_string(decoded.arm), decoded.positions[0], decoded.positions[1],
-      decoded.positions[2], decoded.positions[3], decoded.positions[4],
-      decoded.positions[5], decoded.positions[6]);
+    if (pending > kPendingHighWater) {                       // Rule 2: growing, not dropping
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "%zu samples pending, past the %zu mark (is the publish thread starved?) -- "
+        "nothing is discarded, they will be published late",
+        pending, kPendingHighWater);
+    }
+
+    report_rates(samples.size());
   }
 
   /// Averages the receive and publish rates over the last kRateReportInterval
-  /// datagrams and logs both, then starts a fresh window.
+  /// samples and logs both, then starts a fresh window.
   ///
-  /// Only ever called from the receive thread, which is also the only writer of
-  /// these three members, so they need no synchronisation.
-  void report_rates()
+  /// Called only from the receive thread, which is the only writer of the
+  /// window's own state. window_published_ is the exception: the publish thread
+  /// writes it, so it is an atomic and is read-and-reset in one exchange.
+  void report_rates(std::size_t received)
   {
-    ++window_received_;
+    window_received_ += received;
     if (window_received_ < kRateReportInterval) {
       return;
     }
 
     const auto now = std::chrono::steady_clock::now();
+    const std::uint64_t published = window_published_.exchange(0, std::memory_order_relaxed);
 
     if (window_started_at_ == std::chrono::steady_clock::time_point{}) {
       // First window ever: it began at an unknown time, so it has no duration
       // to divide by. Start the clock here and report from the next one on.
       window_started_at_ = now;
       window_received_ = 0;
-      window_published_ = 0;
       RCLCPP_INFO(
-        get_logger(), "rate: first %lu datagrams received, measuring from here",
+        get_logger(), "rate: first %lu samples received, measuring from here",
         static_cast<unsigned long>(kRateReportInterval));
       return;
     }
@@ -353,30 +520,33 @@ private:
         seconds);
       window_started_at_ = now;
       window_received_ = 0;
-      window_published_ = 0;
       return;
     }
 
     const double receive_hz = static_cast<double>(window_received_) / seconds;
-    const double publish_hz = static_cast<double>(window_published_) / seconds;
+    const double publish_hz = static_cast<double>(published) / seconds;
 
-    if (window_published_ != window_received_) {             // Rule 2: the rates disagree
+    // The two counts no longer have to match exactly: publishing runs a tick
+    // behind receiving, so samples are legitimately still in flight when the
+    // window closes. Nothing is dropped between the two counters any more, so a
+    // gap this much wider than one backlog is the publish thread falling behind,
+    // and that is what deserves a warning.
+    if (window_received_ > published + kPendingHighWater) {   // Rule 2: the rates disagree
       RCLCPP_WARN(
         get_logger(),
-        "rate over %lu datagrams: recv %.1f Hz, push %.1f Hz "
+        "rate over %lu samples: recv %.1f Hz, push %.1f Hz "
         "(%lu of %lu not published)",
         static_cast<unsigned long>(kRateReportInterval), receive_hz, publish_hz,
-        static_cast<unsigned long>(window_received_ - window_published_),
+        static_cast<unsigned long>(window_received_ - published),
         static_cast<unsigned long>(window_received_));
     } else {
       RCLCPP_INFO(
-        get_logger(), "rate over %lu datagrams: recv %.1f Hz, push %.1f Hz",
+        get_logger(), "rate over %lu samples: recv %.1f Hz, push %.1f Hz",
         static_cast<unsigned long>(kRateReportInterval), receive_hz, publish_hz);
     }
 
     window_started_at_ = now;
     window_received_ = 0;
-    window_published_ = 0;
   }
 
   /// Republishes VR button state received from the client.
@@ -489,36 +659,181 @@ private:
     RCLCPP_DEBUG(get_logger(), "answered ping from %s:%u", address, ntohs(sender.sin_port));
   }
 
-  void publish_trajectory(ArmSide side, const std::vector<double> & positions)
+  // --- publish thread --------------------------------------------------------
+
+  /// One tick: take everything the receive thread has collected and publish all
+  /// of it, in arrival order.
+  ///
+  /// The swap is the whole trick: the lock is held for a pointer exchange, not
+  /// for the publishing, so a slow DDS write can never keep the receive thread
+  /// out of recv().
+  void run_publish_loop()
   {
-    if (positions.size() != kNumArmJoints) {                 // Rule 3: size guard
-      RCLCPP_ERROR(
-        get_logger(), "[%s] decoded %zu positions, expected %zu, not publishing",
-        transrecv_udp::to_string(side), positions.size(), kNumArmJoints);
-      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+    auto deadline = std::chrono::steady_clock::now();
+
+    while (publish_running_.load(std::memory_order_relaxed)) {
+      // Take everything waiting and hand back the emptied storage. The lock
+      // covers a pointer swap, never the publishing, so the receive thread is
+      // blocked for the length of a swap and no longer.
+      //
+      // Cleared first so `pending_` gets a vector that has already grown to the
+      // right capacity -- no allocation on the receive path.
+      publish_buffer_.clear();
+      {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        publish_buffer_.swap(pending_);
+      }
+
+      if (publish_buffer_.empty()) {
+        publish_held();
+        wait_for_next_slot(deadline);
+        continue;
+      }
+
+      for (const transrecv_udp::ArmSample & sample : publish_buffer_) {
+        if (!publish_running_.load(std::memory_order_relaxed)) {
+          return;                        // asked to stop mid-batch
+        }
+
+        publish_trajectory(sample);
+        window_published_.fetch_add(1, std::memory_order_relaxed);
+
+        HeldPose & held = last_published_[arm_index(sample.arm)];
+        held.sample = sample;
+        held.has_data = true;
+
+        wait_for_next_slot(deadline);
+      }
+    }
+  }
+
+  /// Sleeps until the next slot and times the loop while it is at it.
+  ///
+  /// Deadlines, not delays: sleeping kPublishPeriod *after* the work makes every
+  /// slot cost period + work, so the real rate always undershoots and drifts
+  /// further out the longer it runs. Advancing a fixed deadline takes the work's
+  /// own duration out of the wait instead of adding it on top.
+  void wait_for_next_slot(std::chrono::steady_clock::time_point & deadline)
+  {
+    report_publish_rate();
+
+    deadline += kPublishPeriod;
+
+    // A slot that overran leaves the deadline in the past, and sleeping until
+    // then returns instantly -- the loop would spin publishing back to back.
+    // Skip to the next whole slot: the backlog is already late and racing
+    // through it only makes the output jerk.
+    const auto now = std::chrono::steady_clock::now();
+    if (deadline < now) {
+      deadline = now + kPublishPeriod;
+    }
+
+    // Plain sleep, no condition variable: the cost is that stop() waits out at
+    // most one slot, which is nothing next to the 200 ms the receive thread
+    // can take to notice the same request.
+    std::this_thread::sleep_until(deadline);
+  }
+
+  /// Times this thread's own cadence and logs it every kRateReportSeconds.
+  ///
+  /// Measured here rather than by a watchdog because only this thread can see
+  /// how late each individual pass was. Two numbers, because one of them lies:
+  /// the average rate is what the loop managed overall, the worst gap is the
+  /// longest it ever went between passes. 500 Hz for 4.9 s and then a 100 ms
+  /// freeze still averages 480 Hz, and the arm feels the 100 ms.
+  ///
+  /// Called at the top of every pass, from the publish thread only, so none of
+  /// this state needs synchronisation.
+  void report_publish_rate()
+  {
+    const auto now = std::chrono::steady_clock::now();
+
+    if (publish_window_started_at_ == std::chrono::steady_clock::time_point{}) {
+      // First pass ever: no previous one to measure a gap against.
+      publish_window_started_at_ = now;
+      last_publish_tick_ = now;
       return;
     }
 
-    const auto & publisher = publishers_[arm_index(side)];
+    const auto gap = now - last_publish_tick_;
+    if (gap > worst_publish_gap_) {
+      worst_publish_gap_ = gap;
+    }
+    last_publish_tick_ = now;
+    ++publish_passes_;
+
+    const double seconds =
+      std::chrono::duration<double>(now - publish_window_started_at_).count();
+    if (seconds < kRateReportSeconds) {   // also the divide-by-zero guard below
+      return;
+    }
+
+    RCLCPP_INFO(
+      get_logger(), "publish thread: %.1f Hz over %.1fs (%lu passes), worst gap %.2f ms",
+      static_cast<double>(publish_passes_) / seconds, seconds,
+      static_cast<unsigned long>(publish_passes_),
+      std::chrono::duration<double, std::milli>(worst_publish_gap_).count());
+
+    publish_window_started_at_ = now;
+    publish_passes_ = 0;
+    worst_publish_gap_ = std::chrono::steady_clock::duration::zero();
+  }
+
+  /// Nothing arrived this tick: republish the pose each arm was last given, so
+  /// the command topic keeps ticking at the publish rate instead of falling
+  /// silent between datagrams.
+  ///
+  /// Repeating the pose the arm already holds is a request to stay put, which is
+  /// the safe thing to say when there is nothing new to say. It also means a
+  /// controller that treats a gap in commands as a fault never sees one.
+  ///
+  /// Held poses are not counted as published samples: no new information reached
+  /// the topic, and counting them would hide a dead link behind a healthy-looking
+  /// publish rate. They get their own counter instead.
+  ///
+  /// last_published_ is touched only by this thread, so it needs no lock.
+  void publish_held()
+  {
+    for (std::size_t index = 0; index < kNumArms; ++index) {
+      const HeldPose & held = last_published_[index];
+
+      if (!held.has_data) {                                  // Rule 2: nothing to hold yet
+        continue;
+      }
+
+      publish_trajectory(held.sample);
+      repeats_published_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  /// No size guard here: ArmSample carries a fixed std::array, so a wrong-sized
+  /// pose cannot reach this point -- the decoder is where a bad length is
+  /// rejected.
+  void publish_trajectory(const transrecv_udp::ArmSample & sample)
+  {
+    const std::size_t index = arm_index(sample.arm);
+
+    const auto & publisher = publishers_[index];
     if (publisher == nullptr) {                              // Rule 3: null guard
       RCLCPP_ERROR(
         get_logger(), "[%s] publisher is null, not publishing",
-        transrecv_udp::to_string(side));
+        transrecv_udp::to_string(sample.arm));
       packets_dropped_.fetch_add(1, std::memory_order_relaxed);
       return;
     }
 
     trajectory_msgs::msg::JointTrajectory message;
-    message.joint_names = transrecv_udp::arm_joint_names(side);
+    // Built once in the constructor: this runs per sample, and rebuilding seven
+    // strings every time is exactly the kind of cost batching is here to remove.
+    message.joint_names = joint_names_[index];
 
     trajectory_msgs::msg::JointTrajectoryPoint point;
-    point.positions = positions;
+    point.positions.assign(sample.positions.begin(), sample.positions.end());
     // time_from_start stays zero: same as the bridge, "go there now".
     message.points.push_back(point);
 
     publisher->publish(message);
     messages_published_.fetch_add(1, std::memory_order_relaxed);
-    ++window_published_;
   }
 
   // --- controller state ------------------------------------------------------
@@ -650,6 +965,14 @@ private:
     const std::uint64_t published = messages_published_.load(std::memory_order_relaxed);
     const std::uint64_t dropped = packets_dropped_.load(std::memory_order_relaxed);
     const std::uint64_t pongs = pongs_sent_.load(std::memory_order_relaxed);
+    const std::uint64_t samples = samples_received_.load(std::memory_order_relaxed);
+    const std::uint64_t repeats = repeats_published_.load(std::memory_order_relaxed);
+
+    std::size_t pending = 0;
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      pending = pending_.size();
+    }
 
     if (received == 0) {
       // last_receive_time_ is still its zero value here, so its age is
@@ -672,17 +995,21 @@ private:
       RCLCPP_WARN(
         get_logger(),
         "health: no datagram for %lds (client stalled?) "
-        "| received=%lu published=%lu pongs=%lu dropped=%lu",
+        "| batches=%lu samples=%lu published=%lu pongs=%lu dropped=%lu",
         static_cast<long>(
           std::chrono::duration_cast<std::chrono::seconds>(since_receive).count()),
-        static_cast<unsigned long>(received), static_cast<unsigned long>(published),
-        static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped));
+        static_cast<unsigned long>(received), static_cast<unsigned long>(samples),
+        static_cast<unsigned long>(published), static_cast<unsigned long>(pongs),
+        static_cast<unsigned long>(dropped));
       return;
     }
 
     RCLCPP_INFO(
-      get_logger(), "health: OK | port=%u received=%lu published=%lu pongs=%lu dropped=%lu",
-      port_, static_cast<unsigned long>(received), static_cast<unsigned long>(published),
+      get_logger(),
+      "health: OK | port=%u batches=%lu samples=%lu published=%lu (repeats=%lu) "
+      "pending=%zu pongs=%lu dropped=%lu",
+      port_, static_cast<unsigned long>(received), static_cast<unsigned long>(samples),
+      static_cast<unsigned long>(published), static_cast<unsigned long>(repeats), pending,
       static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped));
   }
 
@@ -702,20 +1029,56 @@ private:
   std::mutex state_mutex_;
   std::array<ArmState, kNumArms> arm_states_;
 
+  // Arm samples received but not yet published. Written by the receive thread,
+  // swapped out by the publish thread.
+  std::mutex pending_mutex_;
+  std::vector<transrecv_udp::ArmSample> pending_;
+
+  // Touched only by the publish thread: the empty vector handed to pending_ on
+  // each swap. Keeping it as a member is what makes the swap allocation-free
+  // after the first few ticks -- the capacity comes back around.
+  std::vector<transrecv_udp::ArmSample> publish_buffer_;
+
+  /// The last pose published for one arm, kept so a tick with nothing to
+  /// publish can repeat it rather than leave the topic silent.
+  struct HeldPose
+  {
+    transrecv_udp::ArmSample sample;
+    bool has_data = false;
+  };
+
+  // Touched only by the publish thread, so no lock.
+  std::array<HeldPose, kNumArms> last_published_;
+
+  // Touched only by the receive thread: scratch for one datagram's samples,
+  // reused so decoding does not allocate at the client's send rate.
+  std::vector<transrecv_udp::ArmSample> decoded_;
+
   // Written by the receive thread, read by the health thread.
   std::atomic<std::uint64_t> packets_received_{0};
+  std::atomic<std::uint64_t> samples_received_{0};
   std::atomic<std::uint64_t> messages_published_{0};
+  // Held poses republished on an idle tick. Written by the publish thread.
+  std::atomic<std::uint64_t> repeats_published_{0};
+
+  // Publish-thread cadence. Touched only by that thread, hence no atomics.
+  std::chrono::steady_clock::time_point publish_window_started_at_{};
+  std::chrono::steady_clock::time_point last_publish_tick_{};
+  std::chrono::steady_clock::duration worst_publish_gap_{
+    std::chrono::steady_clock::duration::zero()};
+  std::uint64_t publish_passes_ = 0;
+
   std::atomic<std::uint64_t> packets_dropped_{0};
   std::atomic<std::uint64_t> pongs_sent_{0};
   std::atomic<std::chrono::steady_clock::time_point> last_receive_time_{
     std::chrono::steady_clock::time_point{}};
 
-  // Rate-report window. Touched only by the receive thread, hence no atomics:
-  // publish_trajectory() is called from there too, so window_published_ has a
-  // single writer like the other two.
+  // Rate-report window. The first two are touched only by the receive thread,
+  // hence no atomics; window_published_ is written by the publish thread, so it
+  // is one.
   std::chrono::steady_clock::time_point window_started_at_{};
   std::uint64_t window_received_ = 0;
-  std::uint64_t window_published_ = 0;
+  std::atomic<std::uint64_t> window_published_{0};
 
   // Written by the executor thread (controller state callbacks).
   std::atomic<std::uint64_t> states_received_{0};
@@ -727,6 +1090,11 @@ private:
   std::array<rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr, kNumArms>
   publishers_;
 
+  // Built once in the constructor and read by the publish thread; the names
+  // never change, and rebuilding them per sample would allocate seven strings
+  // at the publish rate.
+  std::array<std::vector<std::string>, kNumArms> joint_names_;
+
   rclcpp::Publisher<sensor_msgs::msg::Joy>::SharedPtr buttons_pub_;
 
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
@@ -736,6 +1104,9 @@ private:
 
   std::thread receive_thread_;
   std::atomic<bool> receive_running_{false};
+
+  std::thread publish_thread_;
+  std::atomic<bool> publish_running_{false};
 
   // Declared last on purpose: members are destroyed in reverse order, so these
   // destructors join their threads before the state those threads read

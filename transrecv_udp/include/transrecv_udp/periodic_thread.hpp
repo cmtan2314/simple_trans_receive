@@ -111,10 +111,18 @@ public:
 private:
   void run()
   {
+    // Deadlines, not delays. Waiting `period_` *after* the work finishes makes
+    // every pass cost period + work + wakeup latency, so the real rate always
+    // undershoots and drifts further out the longer it runs. At a 2 ms period
+    // that overhead is a fifth of the period -- a 500 Hz loop measured 420 Hz
+    // before this. Scheduling each wait against a fixed deadline instead means
+    // the work's own duration comes out of the wait, not on top of it.
+    auto deadline = std::chrono::steady_clock::now() + period_;
+
     for (;;) {
       {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait_for(lock, period_, [this]() { return !running_; });
+        cv_.wait_until(lock, deadline, [this]() { return !running_; });
         if (!running_) {
           return;
         }
@@ -126,6 +134,17 @@ private:
       }
 
       work_();
+
+      deadline += period_;
+
+      // A pass that overran its own period leaves the deadline in the past.
+      // Skip ahead to the next whole period rather than firing back-to-back
+      // passes to catch up: the backlog is already late, and a burst of them
+      // only takes the time the next pass needs.
+      const auto now = std::chrono::steady_clock::now();
+      if (deadline < now) {
+        deadline = now + period_;
+      }
     }
   }
 

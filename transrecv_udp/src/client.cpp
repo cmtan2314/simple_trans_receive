@@ -3,13 +3,16 @@
 #include <sys/socket.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -73,7 +76,56 @@ constexpr std::chrono::milliseconds kReceiveTimeout{200};
 constexpr std::chrono::milliseconds kHealthCheckPeriod{5000};
 constexpr std::chrono::seconds kSendStaleThreshold{2};
 
+// The send thread times itself and logs on this period. Same cadence as the
+// health check on purpose: the two lines land together, so one glance shows both
+// what the thread managed and what it carried.
+constexpr double kRateReportSeconds = 5.0;
+
 constexpr std::uint16_t kMinUserPort = 1024;
+
+// --- Command batching --------------------------------------------------------
+// Arm commands no longer go out from the subscription callback. Each callback
+// appends to a vector and this thread drains the whole vector on its own clock,
+// so the executor never waits on a syscall and a burst of callbacks costs one
+// send() instead of one each.
+//
+// 2 ms (500 Hz) is the drain period: fast enough that batching adds at most one
+// tick of latency to a command, slow enough to absorb a burst into one datagram.
+constexpr std::chrono::milliseconds kCommandSendPeriod{2};
+
+// The pending vector has no ceiling. Capping it would mean throwing samples out
+// of the middle of a trajectory to stay under the cap, and a missing middle is
+// exactly what the arm feels as a jump -- worse than the same poses arriving
+// late. It grows instead, so a stalled send thread costs latency and memory,
+// never a discontinuity.
+//
+// It has no reason to grow far: the deadband below keeps a still arm from
+// queueing anything at all, and the send thread empties it every tick. Passing
+// this mark means the socket really is stuck, which earns a warning -- a
+// warning only, nothing is discarded.
+constexpr std::size_t kPendingHighWater = 500;
+
+// --- Deadband ----------------------------------------------------------------
+// A pose that barely differs from the last one queued carries no new
+// instruction, and at teleop rates most poses are exactly that: a still arm
+// republishes the same numbers hundreds of times a second. A sample is dropped
+// before it reaches the buffer when EVERY joint is within this much of the last
+// pose queued for that arm.
+//
+// Compared against the last pose *queued*, not the last received, on purpose.
+// Against the last received, a slow drift of 0.01 per sample would be filtered
+// forever and the far end would fall arbitrarily far behind. Against the last
+// queued, that drift accumulates until it crosses the threshold and is then
+// sent, so the far end is never off by more than the deadband itself.
+constexpr double kJointDeadband = 0.02;
+
+// Both arms, indexed by arm_index().
+constexpr std::size_t kNumArms = 2;
+
+std::size_t arm_index(ArmSide side)
+{
+  return side == ArmSide::kLeft ? 0u : 1u;
+}
 
 /// Parses a port argument. Returns nullopt on a malformed value so the caller
 /// can fail loudly instead of silently talking to the wrong port.
@@ -96,7 +148,21 @@ std::optional<std::uint16_t> parse_port(const std::string & text)
 /// Subscribes to both arms' controller state and pushes the measured joint
 /// positions to the server, which republishes them as commands.
 ///
-/// Three threads beside the executor, each with one job:
+/// Arm commands are batched, not sent one per callback. The subscription
+/// callbacks only append to a vector; the command thread swaps that vector out
+/// on its own clock and sends all of it. That keeps every syscall off the
+/// executor thread and turns a burst of callbacks into one datagram instead of
+/// one each. Buttons and the ping/pong are unchanged -- both are events, and
+/// batching an event only delays it.
+///
+/// A pose only joins that vector if some joint moved past the deadband, so a
+/// still arm puts nothing on the wire at all. Nothing that does join is ever
+/// discarded to save room: the buffer is unbounded, because a gap torn out of a
+/// trajectory is a jump the arm has to make, and late is better than jumpy.
+///
+/// Four threads beside the executor, each with one job:
+///   command    -- drains the pending command vector every 2 ms and sends it as
+///                 MTU-sized batches
 ///   connection -- pings the server every 500 ms and declares the link down
 ///                 when the answers stop
 ///   receive    -- parks in recv() waiting for those answers
@@ -152,9 +218,18 @@ public:
     right_state_pub_ = create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
       kRightControllerStateTopic, qos);
 
+    pending_.reserve(kPendingHighWater);
+    send_buffer_.reserve(kPendingHighWater);
+
     RCLCPP_INFO(
       get_logger(), "forwarding '%s' and '%s' to %s",
       kLeftArmCommandTopic, kRightArmCommandTopic, server_text_.c_str());
+    RCLCPP_INFO(
+      get_logger(),
+      "batching arm commands: drain every %ldms, %zu samples (%zu bytes) per datagram, "
+      "deadband %.3f, unbounded buffer (warns past %zu)",
+      static_cast<long>(kCommandSendPeriod.count()), transrecv_udp::kMaxSamplesPerDatagram,
+      sizeof(transrecv_udp::JointBatchPacket), kJointDeadband, kPendingHighWater);
     RCLCPP_INFO(
       get_logger(), "registered publishers for '%s' and '%s' (depth %zu, reliable)",
       kLeftControllerStateTopic, kRightControllerStateTopic, kStateQueueDepth);
@@ -185,6 +260,7 @@ public:
     receive_thread_ = std::thread([this]() { run_receive_loop(); });
     RCLCPP_INFO(get_logger(), "receive thread started");
 
+    command_thread_.start();
     connection_thread_.start();
     health_thread_.start();
   }
@@ -193,6 +269,7 @@ public:
   void stop()
   {
     health_thread_.stop();
+    command_thread_.stop();
     connection_thread_.stop();
 
     if (!receive_thread_.joinable()) {
@@ -392,44 +469,199 @@ private:
 
     // The message may carry more than the arm joints; take the first seven,
     // matching what the bridge writes on this same topic.
-    const std::vector<double> positions(commanded.begin(), commanded.begin() + kNumArmJoints);
+    transrecv_udp::ArmSample sample;
+    sample.arm = side;
+    std::copy(commanded.begin(), commanded.begin() + kNumArmJoints, sample.positions.begin());
 
-    if (!send_packet(side, positions)) {
+    if (within_deadband(side, sample)) {                      // Rule 2: nothing moved
+      samples_skipped_.fetch_add(1, std::memory_order_relaxed);
+      RCLCPP_DEBUG(
+        get_logger(), "[%s] every joint within %.3f of the last queued pose, not queueing",
+        transrecv_udp::to_string(side), kJointDeadband);
       return;
+    }
+
+    // Recorded before the push, and only when the sample is actually kept: this
+    // is what the next callback measures its motion against.
+    LastPose & last = last_queued_[arm_index(side)];
+    last.positions = sample.positions;
+    last.has_data = true;
+
+    // Appending, not sending: the socket is the send thread's problem, and this
+    // callback is on the executor, which must not be the thread that blocks.
+    std::size_t pending = 0;
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      pending_.push_back(sample);
+      pending = pending_.size();
+    }
+
+    samples_queued_.fetch_add(1, std::memory_order_relaxed);
+
+    if (pending > kPendingHighWater) {                       // Rule 2: growing, not dropping
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "%zu samples pending, past the %zu mark (is the send thread starved?) -- "
+        "nothing is discarded, they will go out late",
+        pending, kPendingHighWater);
     }
 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), kLogThrottleMs,
-      "[%s] sent: [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
-      transrecv_udp::to_string(side), positions[0], positions[1], positions[2],
-      positions[3], positions[4], positions[5], positions[6]);
+      "[%s] queued (%zu pending): [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
+      transrecv_udp::to_string(side), pending, sample.positions[0], sample.positions[1],
+      sample.positions[2], sample.positions[3], sample.positions[4], sample.positions[5],
+      sample.positions[6]);
   }
 
-  /// Single send path, so every failure is counted and logged one way.
-  bool send_packet(ArmSide side, const std::vector<double> & positions)
+  /// True when `sample` is within kJointDeadband of the last pose queued for the
+  /// same arm on every joint, i.e. the arm has not meaningfully moved.
+  ///
+  /// One joint past the threshold is enough to keep the whole pose: a command is
+  /// all seven joints together, and sending six of them is not a thing the wire
+  /// format or the arm can do.
+  ///
+  /// The first sample for an arm always passes -- there is nothing to compare it
+  /// against, and the far end has to be told where the arm is at least once.
+  ///
+  /// Touched only by the executor thread, like last_buttons_sent_: both
+  /// subscription callbacks run there, so the state needs no lock.
+  bool within_deadband(ArmSide side, const transrecv_udp::ArmSample & sample) const
   {
+    const LastPose & last = last_queued_[arm_index(side)];
+
+    if (!last.has_data) {                                    // Rule 2: nothing to compare with
+      return false;
+    }
+
+    for (std::size_t i = 0; i < kNumArmJoints; ++i) {
+      if (std::fabs(last.positions[i] - sample.positions[i]) > kJointDeadband) {
+        return false;                    // this joint moved, the pose is new
+      }
+    }
+    return true;
+  }
+
+  // --- command send thread ---------------------------------------------------
+
+  /// One tick: take everything the callbacks have collected and put all of it on
+  /// the wire, then hand the emptied storage back for the next tick.
+  ///
+  /// The swap is the whole trick: the lock is held for a pointer exchange, not
+  /// for the sends, so a slow socket can never stall a subscription callback.
+  void send_pending_commands()
+  {
+    report_send_rate();
+
+    // Cleared first so the swap hands `pending_` back an empty vector that has
+    // already grown to the right capacity -- no allocation on the callback path.
+    send_buffer_.clear();
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      send_buffer_.swap(pending_);
+    }
+
+    if (send_buffer_.empty()) {
+      return;                          // nothing arrived this tick, which is normal
+    }
+
     if (!socket_.valid()) {                                  // Rule 3: use-before-init
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), kLogThrottleMs,
-        "[%s] socket not open, cannot send", transrecv_udp::to_string(side));
-      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
-      return false;
+        "socket not open, dropping %zu queued samples", send_buffer_.size());
+      samples_dropped_.fetch_add(send_buffer_.size(), std::memory_order_relaxed);
+      return;
     }
 
     if (!connected_.load(std::memory_order_relaxed)) {       // Rule 2: waiting on the retry
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), kLogThrottleMs,
-        "[%s] not connected to %s, dropping state",
-        transrecv_udp::to_string(side), server_text_.c_str());
-      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+        "not connected to %s, dropping %zu queued samples",
+        server_text_.c_str(), send_buffer_.size());
+      samples_dropped_.fetch_add(send_buffer_.size(), std::memory_order_relaxed);
+      return;
+    }
+
+    // One datagram per kMaxSamplesPerDatagram samples. Cutting at the MTU rather
+    // than sending the vector as a single oversized datagram is what keeps a lost
+    // packet costing 24 samples instead of the whole batch.
+    std::size_t offset = 0;
+    while (offset < send_buffer_.size()) {
+      const std::size_t count =
+        std::min(transrecv_udp::kMaxSamplesPerDatagram, send_buffer_.size() - offset);
+
+      if (!send_batch(&send_buffer_[offset], count)) {
+        // The socket errored or the link went down; the samples still queued
+        // behind this chunk are no fresher, so they go too rather than being
+        // sent late out of order.
+        samples_dropped_.fetch_add(send_buffer_.size() - offset, std::memory_order_relaxed);
+        return;
+      }
+      offset += count;
+    }
+  }
+
+  /// Times this thread's own cadence and logs it every kRateReportSeconds.
+  ///
+  /// Measured here rather than by a watchdog because only this thread can see
+  /// how late each individual pass was. Two numbers, because one of them lies:
+  /// the average rate is what the loop managed overall, the worst gap is the
+  /// longest it ever went between passes. 500 Hz for 4.9 s and then a 100 ms
+  /// freeze still averages 480 Hz, and the arm feels the 100 ms.
+  ///
+  /// Called at the top of every pass, from the send thread only, so none of this
+  /// state needs synchronisation.
+  void report_send_rate()
+  {
+    const auto now = std::chrono::steady_clock::now();
+
+    if (send_window_started_at_ == std::chrono::steady_clock::time_point{}) {
+      // First pass ever: no previous one to measure a gap against.
+      send_window_started_at_ = now;
+      last_send_tick_ = now;
+      return;
+    }
+
+    const auto gap = now - last_send_tick_;
+    if (gap > worst_send_gap_) {
+      worst_send_gap_ = gap;
+    }
+    last_send_tick_ = now;
+    ++send_passes_;
+
+    const double seconds = std::chrono::duration<double>(now - send_window_started_at_).count();
+    if (seconds < kRateReportSeconds) {   // also the divide-by-zero guard below
+      return;
+    }
+
+    RCLCPP_INFO(
+      get_logger(), "send thread: %.1f Hz over %.1fs (%lu passes), worst gap %.2f ms",
+      static_cast<double>(send_passes_) / seconds, seconds,
+      static_cast<unsigned long>(send_passes_),
+      std::chrono::duration<double, std::milli>(worst_send_gap_).count());
+
+    send_window_started_at_ = now;
+    send_passes_ = 0;
+    worst_send_gap_ = std::chrono::steady_clock::duration::zero();
+  }
+
+  /// Single send path, so every failure is counted and logged one way.
+  bool send_batch(const transrecv_udp::ArmSample * samples, std::size_t count)
+  {
+    transrecv_udp::JointBatchPacket packet{};
+    const std::size_t bytes = transrecv_udp::encode_joint_batch(samples, count, packet);
+
+    if (bytes == 0) {                                        // Rule 3: encoder rejected it
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "cannot encode a batch of %zu samples (max %zu), dropping it",
+        count, transrecv_udp::kMaxSamplesPerDatagram);
       return false;
     }
 
-    const transrecv_udp::JointPacket packet = transrecv_udp::make_packet(side, positions);
-
     // send(), not sendto(): the peer is fixed by connect(), which is also what
     // makes ECONNREFUSED reach us here.
-    const ssize_t sent = send(socket_.get(), &packet, sizeof(packet), 0);
+    const ssize_t sent = send(socket_.get(), &packet, bytes, 0);
 
     if (sent < 0) {
       if (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EHOSTUNREACH) {
@@ -437,22 +669,22 @@ private:
       } else {
         RCLCPP_WARN_THROTTLE(                                // Rule 2: log the failure path
           get_logger(), *get_clock(), kLogThrottleMs,
-          "[%s] send() failed: %s", transrecv_udp::to_string(side), std::strerror(errno));
+          "send(batch of %zu) failed: %s", count, std::strerror(errno));
       }
       packets_dropped_.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
 
-    if (static_cast<std::size_t>(sent) != sizeof(packet)) {   // Rule 3: short-write guard
+    if (static_cast<std::size_t>(sent) != bytes) {           // Rule 3: short-write guard
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), kLogThrottleMs,
-        "[%s] short send: %zd of %zu bytes", transrecv_udp::to_string(side), sent,
-        sizeof(packet));
+        "short batch send: %zd of %zu bytes", sent, bytes);
       packets_dropped_.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
 
     packets_sent_.fetch_add(1, std::memory_order_relaxed);
+    samples_sent_.fetch_add(count, std::memory_order_relaxed);
     last_send_time_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
     return true;
   }
@@ -643,6 +875,16 @@ private:
     const std::uint64_t dropped = packets_dropped_.load(std::memory_order_relaxed);
     const std::uint64_t pings = pings_sent_.load(std::memory_order_relaxed);
     const std::uint64_t pongs = pongs_received_.load(std::memory_order_relaxed);
+    const std::uint64_t queued = samples_queued_.load(std::memory_order_relaxed);
+    const std::uint64_t samples = samples_sent_.load(std::memory_order_relaxed);
+    const std::uint64_t lost = samples_dropped_.load(std::memory_order_relaxed);
+    const std::uint64_t skipped = samples_skipped_.load(std::memory_order_relaxed);
+
+    std::size_t pending = 0;
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      pending = pending_.size();
+    }
 
     if (!connected_.load(std::memory_order_relaxed)) {       // Rule 2: state-dependent branch
       RCLCPP_WARN(
@@ -655,12 +897,14 @@ private:
     if (sent == 0) {
       // last_send_time_ is still its zero value here, so its age is meaningless
       // -- report "never" rather than the seconds since the steady_clock epoch.
+      // queued>0 separates "nothing is publishing commands" from "commands are
+      // arriving but nothing reaches the wire", which are different faults.
       RCLCPP_WARN(
         get_logger(),
         "health: connected to %s but no joint data sent yet "
-        "(are the controllers publishing state?) | pongs=%lu dropped=%lu",
-        server_text_.c_str(), static_cast<unsigned long>(pongs),
-        static_cast<unsigned long>(dropped));
+        "(are the controllers publishing state?) | queued=%lu pongs=%lu dropped=%lu",
+        server_text_.c_str(), static_cast<unsigned long>(queued),
+        static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped));
       return;
     }
 
@@ -670,16 +914,22 @@ private:
     if (since_send > kSendStaleThreshold) {
       RCLCPP_WARN(
         get_logger(),
-        "health: nothing sent for %lds (controller state stalled?) | sent=%lu dropped=%lu",
+        "health: nothing sent for %lds (controller state stalled?) "
+        "| batches=%lu samples=%lu dropped=%lu",
         static_cast<long>(
           std::chrono::duration_cast<std::chrono::seconds>(since_send).count()),
-        static_cast<unsigned long>(sent), static_cast<unsigned long>(dropped));
+        static_cast<unsigned long>(sent), static_cast<unsigned long>(samples),
+        static_cast<unsigned long>(dropped));
       return;
     }
 
     RCLCPP_INFO(
-      get_logger(), "health: OK | server=%s sent=%lu pongs=%lu dropped=%lu",
+      get_logger(),
+      "health: OK | server=%s batches=%lu samples=%lu/%lu pending=%zu skipped=%lu "
+      "lost=%lu pongs=%lu dropped=%lu",
       server_text_.c_str(), static_cast<unsigned long>(sent),
+      static_cast<unsigned long>(samples), static_cast<unsigned long>(queued), pending,
+      static_cast<unsigned long>(skipped), static_cast<unsigned long>(lost),
       static_cast<unsigned long>(pongs), static_cast<unsigned long>(dropped));
   }
 
@@ -701,6 +951,40 @@ private:
   std::atomic<std::uint64_t> states_published_{0};
   std::atomic<std::uint64_t> buttons_sent_{0};
 
+  /// The newest pose actually queued for one arm, kept only so the next
+  /// callback has something to measure its motion against.
+  struct LastPose
+  {
+    std::array<double, kNumArmJoints> positions{};
+    bool has_data = false;
+  };
+
+  // Touched only by the executor thread (the trajectory callbacks), so no atomic
+  // and no lock -- same reasoning as last_buttons_sent_.
+  std::array<LastPose, kNumArms> last_queued_;
+
+  // Arm commands waiting for the next send tick. Written by the executor
+  // (subscription callbacks), swapped out by the send thread.
+  std::mutex pending_mutex_;
+  std::vector<transrecv_udp::ArmSample> pending_;
+
+  // Touched only by the send thread: the empty vector handed to pending_ on each
+  // swap. Keeping it as a member is what makes the swap allocation-free after
+  // the first few ticks -- the capacity comes back around instead of being freed.
+  std::vector<transrecv_udp::ArmSample> send_buffer_;
+
+  std::atomic<std::uint64_t> samples_queued_{0};
+  std::atomic<std::uint64_t> samples_sent_{0};
+  std::atomic<std::uint64_t> samples_dropped_{0};
+  std::atomic<std::uint64_t> samples_skipped_{0};
+
+  // Send-thread cadence. Touched only by that thread, hence no atomics.
+  std::chrono::steady_clock::time_point send_window_started_at_{};
+  std::chrono::steady_clock::time_point last_send_tick_{};
+  std::chrono::steady_clock::duration worst_send_gap_{
+    std::chrono::steady_clock::duration::zero()};
+  std::uint64_t send_passes_ = 0;
+
   // Touched only by the executor thread (the Joy callback), so no atomic and no
   // lock: the send path for buttons runs entirely inside that callback.
   std::vector<std::uint8_t> last_buttons_sent_;
@@ -718,6 +1002,9 @@ private:
 
   // Declared last on purpose: members are destroyed in reverse order, so these
   // destructors join their threads before the state those threads read.
+  transrecv_udp::PeriodicThread command_thread_{
+    kCommandSendPeriod, get_logger(), [this]() { send_pending_commands(); },
+    "command send thread"};
   transrecv_udp::PeriodicThread connection_thread_{
     kPingPeriod, get_logger(), [this]() { maintain_connection(); }, "connection thread"};
   transrecv_udp::PeriodicThread health_thread_{
