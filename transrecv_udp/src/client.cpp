@@ -117,7 +117,20 @@ constexpr std::size_t kPendingHighWater = 500;
 // forever and the far end would fall arbitrarily far behind. Against the last
 // queued, that drift accumulates until it crosses the threshold and is then
 // sent, so the far end is never off by more than the deadband itself.
-constexpr double kJointDeadband = 0.02;
+//
+// The value is chosen from the worst thing it can ask the arm to do, not from
+// how much traffic it saves. Skipping samples means the next one that survives
+// carries the whole accumulated motion, and the far end still has only one
+// publish slot to cover it:
+//
+//     worst commanded velocity = kJointDeadband / publish slot
+//
+// At 0.02 rad that is 12 rad/s of pure fiction handed to the controller, which
+// is a jerk, not a filter. At 0.0002 rad it is 0.12 rad/s -- slower than the arm
+// moves anyway, so it can no longer manufacture a motion of its own. 0.0002 rad
+// is 0.0115 degrees, under the mechanical repeatability of the joint, so what it
+// removes from the trajectory is below what the arm could reproduce.
+constexpr double kJointDeadband = 0.0002;
 
 // Both arms, indexed by arm_index().
 constexpr std::size_t kNumArms = 2;
