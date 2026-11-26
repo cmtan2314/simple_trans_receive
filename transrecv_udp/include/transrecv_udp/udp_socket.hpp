@@ -9,6 +9,8 @@
 
 #include <cerrno>
 #include <chrono>
+#include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -123,6 +125,55 @@ public:
       RCLCPP_ERROR(logger, "setsockopt(SO_RCVTIMEO) failed: %s", std::strerror(errno));
       return false;
     }
+    return true;
+  }
+
+  /// Asks for a larger kernel receive buffer.
+  ///
+  /// A camera frame arrives as a burst of chunks; if the buffer fills before
+  /// the receive thread drains it, the kernel drops chunks and the whole frame
+  /// is lost. The kernel silently caps the request at net.core.rmem_max, so the
+  /// granted size is read back and a short grant is reported, not assumed away.
+  /// Linux reports back double the request (it counts its own bookkeeping), so
+  /// a full grant reads as >= requested.
+  bool set_receive_buffer(std::size_t bytes, const rclcpp::Logger & logger)
+  {
+    if (fd_ < 0) {                                  // Rule 3: use-before-open
+      RCLCPP_ERROR(logger, "cannot set receive buffer, socket is not open");
+      return false;
+    }
+
+    if (bytes == 0 || bytes > static_cast<std::size_t>(INT_MAX)) {   // Rule 3: range guard
+      RCLCPP_ERROR(logger, "receive buffer of %zu bytes is out of range, refusing", bytes);
+      return false;
+    }
+
+    const int requested = static_cast<int>(bytes);
+    if (setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &requested, sizeof(requested)) < 0) {
+      RCLCPP_ERROR(logger, "setsockopt(SO_RCVBUF, %d) failed: %s", requested, std::strerror(errno));
+      return false;
+    }
+
+    int granted = 0;
+    socklen_t granted_len = sizeof(granted);
+    if (getsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &granted, &granted_len) < 0) {
+      RCLCPP_WARN(                                  // Rule 2: set, but cannot confirm
+        logger, "receive buffer requested (%d bytes) but getsockopt failed: %s",
+        requested, std::strerror(errno));
+      return true;
+    }
+
+    if (granted < requested) {                      // Rule 2: capped by the kernel
+      RCLCPP_WARN(
+        logger,
+        "receive buffer: asked for %d bytes, kernel granted %d (capped by "
+        "net.core.rmem_max). Camera frames may lose chunks under load; raise it with "
+        "'sudo sysctl -w net.core.rmem_max=%d'",
+        requested, granted, requested);
+      return true;
+    }
+
+    RCLCPP_INFO(logger, "receive buffer set to %d bytes (kernel reports %d)", requested, granted);
     return true;
   }
 

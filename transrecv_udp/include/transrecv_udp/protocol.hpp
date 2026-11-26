@@ -5,21 +5,22 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace transrecv_udp
 {
 
-/// Wire protocol for the one-way UDP link.
+/// Wire protocol for the UDP link.
 ///
-///   client: reads measured joint state -> sends here
-///   server: receives -> republishes as a JointTrajectory command
+///   client -> server: arm + hand trajectory commands, VR buttons, pings
+///   server -> client: arm + hand controller state, pongs
 ///
-/// Joint data only ever flows client -> server. The one thing that travels the
-/// other way is a liveness reply: the client pings, the server pongs, and the
-/// client treats itself as connected only while pongs keep coming back.
+/// The client pings, the server pongs, and the client treats itself as
+/// connected only while pongs keep coming back.
 ///
 /// That reply is what makes the check real. UDP's connect() sends nothing and
 /// cannot fail, and the ICMP port-unreachable it would otherwise rely on is
@@ -28,8 +29,8 @@ namespace transrecv_udp
 ///
 /// Every packet type has a different fixed size, so a datagram is classified by
 /// length before anything is decoded, and a wrong-sized one is rejected on size
-/// alone: ControlPacket 8, ButtonPacket 12, JointPacket 64. The static_asserts
-/// below enforce that they stay distinct.
+/// alone: ControlPacket 8, ButtonPacket 12, HandPacket 56, JointPacket 64. The
+/// static_asserts below enforce that they stay distinct.
 
 // Each arm is a 7-DOF OpenArm. Single source of truth for every buffer size.
 constexpr std::size_t kNumArmJoints = 7;
@@ -69,18 +70,38 @@ static_assert(
   sizeof(JointPacket) == kJointPacketBytes,
   "JointPacket must be tightly packed for the wire format");
 
+namespace detail
+{
+/// Number of joints a sided packet type carries, read off its array so the
+/// count is never restated by hand.
+template<typename Packet>
+constexpr std::size_t joint_count_of()
+{
+  return std::extent<decltype(Packet::positions)>::value;
+}
+
+/// Shared by every "side + positions" packet (arm and hand). `positions` must
+/// hold exactly joint_count_of<Packet>() entries; the caller checks that (and
+/// logs) before calling.
+template<typename Packet>
+inline Packet make_sided_packet(ArmSide side, const std::vector<double> & positions)
+{
+  Packet packet{};
+  packet.magic = htonl(kPacketMagic);
+  packet.arm = htonl(static_cast<std::uint32_t>(side));
+
+  if (positions.size() == joint_count_of<Packet>()) {   // Rule 3: never copy a wrong size
+    std::memcpy(packet.positions, positions.data(), sizeof(packet.positions));
+  }
+  return packet;
+}
+}  // namespace detail
+
 /// Fills a packet ready to send. `positions` must hold exactly kNumArmJoints
 /// entries; the caller checks that (and logs) before calling.
 inline JointPacket make_packet(ArmSide arm, const std::vector<double> & positions)
 {
-  JointPacket packet{};
-  packet.magic = htonl(kPacketMagic);
-  packet.arm = htonl(static_cast<std::uint32_t>(arm));
-
-  if (positions.size() == kNumArmJoints) {          // Rule 3: never copy a wrong size
-    std::memcpy(packet.positions, positions.data(), sizeof(packet.positions));
-  }
-  return packet;
+  return detail::make_sided_packet<JointPacket>(arm, positions);
 }
 
 /// The liveness exchange. Deliberately a different size from JointPacket so the
@@ -239,10 +260,13 @@ struct DecodedPacket
   std::vector<double> positions;
 };
 
-/// Validates and decodes a datagram. Returns false (with `reason` filled in for
-/// the caller to log) on any malformed input -- wrong size, bad magic, unknown
-/// arm. Never partially fills `out`.
-inline bool decode_packet(
+namespace detail
+{
+/// Validates and decodes any "side + positions" datagram. Returns false (with
+/// `reason` filled in for the caller to log) on any malformed input -- wrong
+/// size, bad magic, unknown side. Never partially fills `out`.
+template<typename Packet>
+inline bool decode_sided_packet(
   const void * data, std::size_t length, DecodedPacket & out, std::string & reason)
 {
   if (data == nullptr) {                            // Rule 3: null guard
@@ -250,12 +274,12 @@ inline bool decode_packet(
     return false;
   }
 
-  if (length != sizeof(JointPacket)) {              // Rule 3: size guard
-    reason = "size " + std::to_string(length) + " != " + std::to_string(sizeof(JointPacket));
+  if (length != sizeof(Packet)) {                   // Rule 3: size guard
+    reason = "size " + std::to_string(length) + " != " + std::to_string(sizeof(Packet));
     return false;
   }
 
-  JointPacket packet{};
+  Packet packet{};
   std::memcpy(&packet, data, sizeof(packet));
 
   const std::uint32_t magic = ntohl(packet.magic);
@@ -266,13 +290,95 @@ inline bool decode_packet(
 
   const std::uint32_t arm = ntohl(packet.arm);
   if (arm > static_cast<std::uint32_t>(ArmSide::kRight)) {   // Rule 3: enum range
-    reason = "unknown arm " + std::to_string(arm);
+    reason = "unknown side " + std::to_string(arm);
     return false;
   }
 
   out.arm = static_cast<ArmSide>(arm);
-  out.positions.assign(packet.positions, packet.positions + kNumArmJoints);
+  out.positions.assign(packet.positions, packet.positions + joint_count_of<Packet>());
   return true;
+}
+}  // namespace detail
+
+/// Validates and decodes an arm datagram. See detail::decode_sided_packet.
+inline bool decode_packet(
+  const void * data, std::size_t length, DecodedPacket & out, std::string & reason)
+{
+  return detail::decode_sided_packet<JointPacket>(data, length, out, reason);
+}
+
+// --- Revo2 hands ------------------------------------------------------------
+// Each <side>_revo2_hand_controller drives six joints: thumb metacarpal, thumb
+// proximal, then index/middle/ring/pinky proximal. The distal joints are mimic
+// joints and are not part of the controller, so they never travel.
+constexpr std::size_t kNumHandJoints = 6;
+
+/// Same layout as JointPacket, six positions instead of seven. `arm` carries
+/// the hand's side as an ArmSide value (the name is shared so both packet
+/// types go through the same encode/decode template).
+#pragma pack(push, 1)
+struct HandPacket
+{
+  std::uint32_t magic;
+  std::uint32_t arm;
+  double positions[kNumHandJoints];
+};
+#pragma pack(pop)
+
+constexpr std::size_t kHandPacketBytes =
+  sizeof(std::uint32_t) * 2 + sizeof(double) * kNumHandJoints;
+static_assert(
+  sizeof(HandPacket) == kHandPacketBytes,
+  "HandPacket must be tightly packed for the wire format");
+static_assert(
+  sizeof(HandPacket) != sizeof(JointPacket) &&
+  sizeof(HandPacket) != sizeof(ControlPacket) &&
+  sizeof(HandPacket) != sizeof(ButtonPacket),
+  "every packet type must have a distinct size, that is how they are told apart");
+
+/// Fills a hand packet ready to send. `positions` must hold exactly
+/// kNumHandJoints entries; the caller checks that (and logs) before calling.
+inline HandPacket make_hand_packet(ArmSide side, const std::vector<double> & positions)
+{
+  return detail::make_sided_packet<HandPacket>(side, positions);
+}
+
+/// Validates and decodes a hand datagram. See detail::decode_sided_packet.
+inline bool decode_hand_packet(
+  const void * data, std::size_t length, DecodedPacket & out, std::string & reason)
+{
+  return detail::decode_sided_packet<HandPacket>(data, length, out, reason);
+}
+
+/// Joint names of <side>_revo2_hand_controller, in controller order
+/// (brainco_hand_ros2 revo2_<side>_controllers.yaml).
+inline std::vector<std::string> hand_joint_names(ArmSide side)
+{
+  static constexpr const char * kFingerJoints[kNumHandJoints] = {
+    "thumb_metacarpal_joint", "thumb_proximal_joint", "index_proximal_joint",
+    "middle_proximal_joint", "ring_proximal_joint", "pinky_proximal_joint"};
+
+  const std::string prefix = side == ArmSide::kLeft ? "left_" : "right_";
+  std::vector<std::string> names;
+  names.reserve(kNumHandJoints);
+  for (const char * joint : kFingerJoints) {
+    names.push_back(prefix + joint);
+  }
+  return names;
+}
+
+/// "[0.000 0.123 ...]" for log lines, whatever the joint count.
+inline std::string describe_positions(const std::vector<double> & positions)
+{
+  constexpr std::size_t kValueChars = 16;           // "-123.456 " with headroom
+  std::string text = "[";
+  text.reserve(positions.size() * kValueChars);
+  char value[kValueChars] = {};
+  for (std::size_t i = 0; i < positions.size(); ++i) {
+    std::snprintf(value, sizeof(value), i == 0 ? "%.3f" : " %.3f", positions[i]);
+    text += value;
+  }
+  return text + "]";
 }
 
 // Joint names used by the dora bridge (dora_ros2_bridge/main.py), so a
