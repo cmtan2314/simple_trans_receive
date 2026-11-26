@@ -6,10 +6,12 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -18,9 +20,11 @@
 #include <rclcpp/rclcpp.hpp>
 #include <control_msgs/msg/joint_trajectory_controller_state.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/joy.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
+#include "transrecv_udp/image_protocol.hpp"
 #include "transrecv_udp/periodic_thread.hpp"
 #include "transrecv_udp/protocol.hpp"
 #include "transrecv_udp/udp_socket.hpp"
@@ -56,6 +60,16 @@ constexpr const char * kRightEePoseTopic = "/right_ee_pose";
 // Revo2 hand (gripper) commands received from the client and republished here.
 constexpr const char * kLeftHandTrajectoryTopic = "/left_revo2_hand_controller/joint_trajectory";
 constexpr const char * kRightHandTrajectoryTopic = "/right_revo2_hand_controller/joint_trajectory";
+
+// Measured Revo2 hand state, forwarded to the client next to the arms' state.
+constexpr const char * kLeftHandStateTopic = "/left_revo2_hand_controller/controller_state";
+constexpr const char * kRightHandStateTopic = "/right_revo2_hand_controller/controller_state";
+
+// Head camera, forwarded to the client on its own thread (see run_image_loop).
+// Subscribed with SensorDataQoS (best effort): it matches a camera publisher
+// whether that one is reliable or best effort, and a stale frame is not worth
+// a retransmission anyway.
+constexpr const char * kHeadCameraTopic = "/cam_head/cam_head/color/image_raw/compressed";
 
 constexpr std::size_t kStateQueueDepth = 10;
 constexpr std::size_t kButtonQueueDepth = 10;
@@ -215,7 +229,28 @@ public:
       [this](control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr msg) {
         on_controller_state(ArmSide::kRight, msg);
       });
+    left_hand_state_sub_ = create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
+      kLeftHandStateTopic, state_qos,
+      [this](control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr msg) {
+        on_hand_state(ArmSide::kLeft, msg);
+      });
+    right_hand_state_sub_ = create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
+      kRightHandStateTopic, state_qos,
+      [this](control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr msg) {
+        on_hand_state(ArmSide::kRight, msg);
+      });
 
+    image_sub_ = create_subscription<sensor_msgs::msg::CompressedImage>(
+      kHeadCameraTopic, rclcpp::SensorDataQoS(),
+      [this](sensor_msgs::msg::CompressedImage::ConstSharedPtr msg) { on_image(msg); });
+
+    RCLCPP_INFO(
+      get_logger(), "subscribed to '%s' and '%s' (depth %zu, reliable)",
+      kLeftHandStateTopic, kRightHandStateTopic, kStateQueueDepth);
+    RCLCPP_INFO(
+      get_logger(), "forwarding '%s' to %s on its own thread, newest frame only, "
+      "%zu byte chunks",
+      kHeadCameraTopic, client_text_.c_str(), transrecv_udp::kImageChunkPayloadBytes);
     RCLCPP_INFO(
       get_logger(), "publishing on '%s' and '%s' (depth %zu, reliable)",
       kLeftArmTrajectoryTopic, kRightArmTrajectoryTopic, kTrajectoryQueueDepth);
@@ -252,15 +287,32 @@ public:
     receive_thread_ = std::thread([this]() { run_receive_loop(); });
     RCLCPP_INFO(get_logger(), "receive thread started");
 
+    {
+      std::lock_guard<std::mutex> lock(image_mutex_);
+      image_running_ = true;
+    }
+    image_thread_ = std::thread([this]() { run_image_loop(); });
+    RCLCPP_INFO(get_logger(), "image thread started");
+
     send_thread_.start();
     health_thread_.start();
   }
 
-  /// Stops both threads and joins them. Safe to call twice.
+  /// Stops every thread and joins them. Safe to call twice.
   void stop()
   {
     health_thread_.stop();
     send_thread_.stop();
+
+    if (image_thread_.joinable()) {
+      {
+        std::lock_guard<std::mutex> lock(image_mutex_);
+        image_running_ = false;
+      }
+      image_cv_.notify_all();          // wake it now, it may be parked waiting for a frame
+      image_thread_.join();
+      RCLCPP_INFO(get_logger(), "image thread stopped");
+    }
 
     if (!receive_thread_.joinable()) {
       return;
@@ -778,6 +830,42 @@ private:
       feedback[3], feedback[4], feedback[5], feedback[6]);
   }
 
+  /// Hand counterpart of on_controller_state(): runs on the executor and only
+  /// stores the newest hand pose for the send thread.
+  void on_hand_state(
+    ArmSide side, control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr msg)
+  {
+    if (msg == nullptr) {                                    // Rule 3: null guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s hand] null controller state, dropping",
+        transrecv_udp::to_string(side));
+      return;
+    }
+
+    const std::vector<double> & feedback = msg->feedback.positions;
+    if (feedback.size() < kNumHandJoints) {                  // Rule 3: size guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s hand] feedback has %zu positions, need %zu, dropping",
+        transrecv_udp::to_string(side), feedback.size(), kNumHandJoints);
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      ArmState & state = hand_states_[arm_index(side)];
+      state.positions.assign(feedback.begin(), feedback.begin() + kNumHandJoints);
+      state.has_data = true;
+    }
+
+    hand_states_received_.fetch_add(1, std::memory_order_relaxed);
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kDataLogThrottleMs,
+      "[%s hand] controller state: [%.3f %.3f %.3f %.3f %.3f %.3f]",
+      transrecv_udp::to_string(side), feedback[0], feedback[1], feedback[2],
+      feedback[3], feedback[4], feedback[5]);
+  }
+
   // --- send thread -----------------------------------------------------------
 
   /// One tick: push each arm's newest controller state to the client.
@@ -814,6 +902,67 @@ private:
 
       send_state(side, positions);
     }
+
+    // Hands ride on the same tick, so arm and hand state reach the client at
+    // the same rate and from the same instant.
+    for (std::size_t index = 0; index < kNumArms; ++index) {
+      const ArmSide side = index == 0 ? ArmSide::kLeft : ArmSide::kRight;
+
+      std::vector<double> positions;
+      {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        const ArmState & state = hand_states_[index];
+        if (!state.has_data) {                               // Rule 2: nothing to send yet
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), kLogThrottleMs,
+            "[%s hand] no controller state received yet, nothing to send",
+            transrecv_udp::to_string(side));
+          continue;
+        }
+        positions = state.positions;
+      }
+
+      send_hand_state(side, positions);
+    }
+  }
+
+  /// Sends one hand's state as a HandJointPacket: the same 56 byte packet the
+  /// client uses for hand commands, here travelling the other way.
+  void send_hand_state(ArmSide side, const std::vector<double> & positions)
+  {
+    if (positions.size() != kNumHandJoints) {                // Rule 3: size guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s hand] held state has %zu positions, expected %zu, not sending",
+        transrecv_udp::to_string(side), positions.size(), kNumHandJoints);
+      return;
+    }
+
+    const transrecv_udp::HandJointPacket packet =
+      transrecv_udp::make_hand_packet(side, positions);
+
+    const ssize_t sent = sendto(
+      socket_fd_, &packet, sizeof(packet), 0,
+      reinterpret_cast<const sockaddr *>(&client_), sizeof(client_));
+
+    if (sent < 0) {
+      RCLCPP_WARN_THROTTLE(                                  // Rule 2: log the failure path
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s hand] sendto(%s) failed: %s", transrecv_udp::to_string(side),
+        client_text_.c_str(), std::strerror(errno));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    if (static_cast<std::size_t>(sent) != sizeof(packet)) {   // Rule 3: short-write guard
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[%s hand] short send: %zd of %zu bytes", transrecv_udp::to_string(side), sent,
+        sizeof(packet));
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    hand_states_sent_.fetch_add(1, std::memory_order_relaxed);
   }
 
   void send_state(ArmSide side, const std::vector<double> & positions)
@@ -852,7 +1001,169 @@ private:
     states_sent_.fetch_add(1, std::memory_order_relaxed);
   }
 
+  // --- image thread ----------------------------------------------------------
+
+  /// Runs on the ROS executor. Only parks the newest frame and wakes the image
+  /// thread: chunking and sending a frame is far too slow to do inside a
+  /// callback that shares the executor with the controller state.
+  ///
+  /// A frame that is still waiting when the next one arrives is replaced, not
+  /// queued. If the link cannot keep up with the camera, a queue would only
+  /// grow the delay; dropping keeps the client on the newest picture.
+  void on_image(sensor_msgs::msg::CompressedImage::ConstSharedPtr msg)
+  {
+    if (msg == nullptr) {                                    // Rule 3: null guard
+      RCLCPP_ERROR(get_logger(), "[image] null message on '%s', dropping", kHeadCameraTopic);
+      return;
+    }
+
+    if (msg->data.empty()) {                                 // Rule 3: empty guard
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[image] empty frame on '%s', dropping", kHeadCameraTopic);
+      return;
+    }
+
+    images_received_.fetch_add(1, std::memory_order_relaxed);
+
+    bool replaced = false;
+    {
+      std::lock_guard<std::mutex> lock(image_mutex_);
+      replaced = pending_image_ != nullptr;
+      pending_image_ = std::move(msg);
+    }
+    image_cv_.notify_one();
+
+    if (replaced) {                                          // Rule 2: link slower than camera
+      images_replaced_.fetch_add(1, std::memory_order_relaxed);
+      RCLCPP_DEBUG(get_logger(), "[image] previous frame not sent yet, replaced by the newest");
+    }
+  }
+
+  /// The image thread: parks until a frame is waiting, then sends it. Its own
+  /// thread so a large frame going out chunk by chunk never delays the 100 Hz
+  /// controller state, and so the camera rate never has to match the socket's.
+  void run_image_loop()
+  {
+    for (;;) {
+      sensor_msgs::msg::CompressedImage::ConstSharedPtr frame;
+      {
+        std::unique_lock<std::mutex> lock(image_mutex_);
+        image_cv_.wait(lock, [this]() { return !image_running_ || pending_image_ != nullptr; });
+        if (!image_running_) {                               // Rule 2: log why the loop ends
+          RCLCPP_DEBUG(get_logger(), "image thread: stop requested, exiting");
+          return;
+        }
+        frame = std::move(pending_image_);
+        pending_image_.reset();
+      }
+
+      if (frame == nullptr) {                                // Rule 3: null guard
+        RCLCPP_ERROR(get_logger(), "image thread: woke with no frame, waiting again");
+        continue;
+      }
+
+      send_image(*frame);
+    }
+  }
+
+  /// Serialises one frame and sends it as a burst of chunks. Touches
+  /// image_blob_ and image_datagram_, which only this thread uses.
+  void send_image(const sensor_msgs::msg::CompressedImage & image)
+  {
+    if (socket_fd_ < 0) {                                    // Rule 3: socket sanity
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs, "[image] socket is not open, cannot send");
+      images_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    std::string reason;
+    if (!transrecv_udp::encode_image_frame(
+        image.header.stamp.sec, image.header.stamp.nanosec, image.format,
+        image.header.frame_id, image.data.data(), image.data.size(), image_blob_, reason))
+    {
+      RCLCPP_WARN_THROTTLE(                                  // Rule 2: reject, don't guess
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[image] cannot encode frame: %s", reason.c_str());
+      images_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    const std::uint32_t seq = next_image_seq_++;
+    const std::size_t chunk_count = transrecv_udp::image_chunk_count(image_blob_.size());
+
+    for (std::size_t index = 0; index < chunk_count; ++index) {
+      const std::size_t bytes =
+        transrecv_udp::make_image_chunk(seq, image_blob_, index, image_datagram_);
+      if (bytes == 0) {                                      // Rule 3: chunking guard
+        RCLCPP_ERROR(
+          get_logger(), "[image] frame %u: cannot build chunk %zu of %zu, dropping frame",
+          seq, index, chunk_count);
+        images_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+
+      const ssize_t sent = sendto(
+        socket_fd_, image_datagram_.data(), bytes, 0,
+        reinterpret_cast<const sockaddr *>(&client_), sizeof(client_));
+
+      // A failed chunk means the client can never complete this frame, so the
+      // rest of it would only be wasted bandwidth.
+      if (sent < 0) {
+        RCLCPP_WARN_THROTTLE(                                // Rule 2: log the failure path
+          get_logger(), *get_clock(), kLogThrottleMs,
+          "[image] frame %u: sendto(%s) failed on chunk %zu of %zu: %s, dropping frame",
+          seq, client_text_.c_str(), index, chunk_count, std::strerror(errno));
+        images_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+
+      if (static_cast<std::size_t>(sent) != bytes) {         // Rule 3: short-write guard
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), kLogThrottleMs,
+          "[image] frame %u: short send on chunk %zu: %zd of %zu bytes, dropping frame",
+          seq, index, sent, bytes);
+        images_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+
+    images_sent_.fetch_add(1, std::memory_order_relaxed);
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kDataLogThrottleMs,
+      "[image] frame %u sent: %zu bytes (%s) in %zu chunks", seq, image.data.size(),
+      image.format.c_str(), chunk_count);
+  }
+
   // --- health thread ---------------------------------------------------------
+
+  /// Hand-state and image half of the health report, kept apart so it is
+  /// printed whatever state the joint link is in.
+  void report_hand_and_image_health()
+  {
+    RCLCPP_INFO(
+      get_logger(), "health: hand state received=%lu sent=%lu",
+      static_cast<unsigned long>(hand_states_received_.load(std::memory_order_relaxed)),
+      static_cast<unsigned long>(hand_states_sent_.load(std::memory_order_relaxed)));
+
+    const std::uint64_t received = images_received_.load(std::memory_order_relaxed);
+    const std::uint64_t sent = images_sent_.load(std::memory_order_relaxed);
+    const std::uint64_t replaced = images_replaced_.load(std::memory_order_relaxed);
+    const std::uint64_t dropped = images_dropped_.load(std::memory_order_relaxed);
+
+    if (received == 0) {                                     // Rule 2: camera silent
+      RCLCPP_WARN(
+        get_logger(), "health: no image on '%s' yet (is the camera running?)", kHeadCameraTopic);
+      return;
+    }
+
+    RCLCPP_INFO(
+      get_logger(), "health: image received=%lu sent=%lu replaced=%lu dropped=%lu",
+      static_cast<unsigned long>(received), static_cast<unsigned long>(sent),
+      static_cast<unsigned long>(replaced), static_cast<unsigned long>(dropped));
+  }
 
   /// One watchdog pass. Its own thread on purpose: if the receive thread
   /// stalls, the report has to come from somewhere that did not.
@@ -862,6 +1173,8 @@ private:
       RCLCPP_ERROR(get_logger(), "health: socket fd is invalid, server is dead");
       return;
     }
+
+    report_hand_and_image_health();
 
     const std::uint64_t received = packets_received_.load(std::memory_order_relaxed);
     const std::uint64_t published = messages_published_.load(std::memory_order_relaxed);
@@ -939,6 +1252,7 @@ private:
   // Written by the ROS executor (state callbacks), read by the send thread.
   std::mutex state_mutex_;
   std::array<ArmState, kNumArms> arm_states_;
+  std::array<ArmState, kNumArms> hand_states_;
 
   // Written by the receive thread, read by the health thread.
   std::atomic<std::uint64_t> packets_received_{0};
@@ -982,9 +1296,37 @@ private:
     left_state_sub_;
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
     right_state_sub_;
+  rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
+    left_hand_state_sub_;
+  rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
+    right_hand_state_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr image_sub_;
+
+  // Hand state: written by the executor, sent by the send thread.
+  std::atomic<std::uint64_t> hand_states_received_{0};
+  std::atomic<std::uint64_t> hand_states_sent_{0};
 
   std::thread receive_thread_;
   std::atomic<bool> receive_running_{false};
+
+  // Image hand-off: the executor parks the newest frame in pending_image_, the
+  // image thread takes it. image_running_ lives under the same mutex so the
+  // stop request and a new frame are both seen by the same wait predicate.
+  std::mutex image_mutex_;
+  std::condition_variable image_cv_;
+  sensor_msgs::msg::CompressedImage::ConstSharedPtr pending_image_;
+  bool image_running_ = false;
+  std::thread image_thread_;
+
+  // Touched only by the image thread.
+  std::uint32_t next_image_seq_ = 0;
+  std::vector<std::uint8_t> image_blob_;
+  transrecv_udp::ImageDatagram image_datagram_{};
+
+  std::atomic<std::uint64_t> images_received_{0};   // executor
+  std::atomic<std::uint64_t> images_replaced_{0};   // executor
+  std::atomic<std::uint64_t> images_sent_{0};       // image thread
+  std::atomic<std::uint64_t> images_dropped_{0};    // image thread
 
   // Declared last on purpose: members are destroyed in reverse order, so these
   // destructors join their threads before the state those threads read

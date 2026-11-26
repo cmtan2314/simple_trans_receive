@@ -13,14 +13,16 @@
 namespace transrecv_udp
 {
 
-/// Wire protocol for the one-way UDP link.
+/// Wire protocol for the UDP link.
 ///
-///   client: reads measured joint state -> sends here
-///   server: receives -> republishes as a JointTrajectory command
+///   client -> server: arm commands (DualJointPacket), hand commands
+///                     (HandJointPacket), ee_pose, VR buttons, pings
+///   server -> client: arm controller state (JointPacket), hand controller
+///                     state (HandJointPacket), head camera frames (chunked,
+///                     see image_protocol.hpp), pongs
 ///
-/// Joint data only ever flows client -> server. The one thing that travels the
-/// other way is a liveness reply: the client pings, the server pongs, and the
-/// client treats itself as connected only while pongs keep coming back.
+/// The client pings, the server pongs, and the client treats itself as
+/// connected only while pongs keep coming back.
 ///
 /// That reply is what makes the check real. UDP's connect() sends nothing and
 /// cannot fail, and the ICMP port-unreachable it would otherwise rely on is

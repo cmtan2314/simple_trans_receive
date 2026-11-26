@@ -22,9 +22,11 @@
 #include <rclcpp/rclcpp.hpp>
 #include <control_msgs/msg/joint_trajectory_controller_state.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/joy.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
+#include "transrecv_udp/image_protocol.hpp"
 #include "transrecv_udp/periodic_thread.hpp"
 #include "transrecv_udp/protocol.hpp"
 #include "transrecv_udp/udp_socket.hpp"
@@ -61,7 +63,28 @@ constexpr const char * kRightEePoseTopic = "/right_ee_pose";
 constexpr const char * kLeftHandCommandTopic = "/left_revo2_hand_controller/joint_trajectory";
 constexpr const char * kRightHandCommandTopic = "/right_revo2_hand_controller/joint_trajectory";
 
+// Revo2 hand state pushed by the server, republished locally.
+constexpr const char * kLeftHandStateTopic = "/left_revo2_hand_controller/controller_state";
+constexpr const char * kRightHandStateTopic = "/right_revo2_hand_controller/controller_state";
+
 constexpr std::size_t kStateQueueDepth = 10;
+
+// Head camera frames rebuilt from the server's chunks, republished under the
+// same name. Reliable so it matches both reliable and best-effort subscribers;
+// depth 1 because only the newest frame matters.
+constexpr const char * kHeadCameraTopic = "/cam_head/cam_head/color/image_raw/compressed";
+constexpr std::size_t kImageQueueDepth = 1;
+
+// A frame lands as a burst of ~1.4 KB chunks (a 640x480 JPEG is ~70 of them).
+// The kernel buffer has to hold the whole burst while the receive thread is
+// busy publishing the previous frame; 4 MiB is room for several 1080p frames.
+constexpr std::size_t kSocketReceiveBufferBytes = 4u * 1024u * 1024u;
+
+// recv() buffer: big enough for an image chunk, and one byte more than the
+// largest datagram for the same reason as transrecv_udp::kReceiveBufferBytes --
+// an oversized datagram then comes back at a length nothing accepts.
+constexpr std::size_t kRecvBufferBytes =
+  std::max(transrecv_udp::kReceiveBufferBytes, transrecv_udp::kMaxImageDatagramBytes + 1);
 
 // Buttons are events, not a stream, so a small depth is plenty. The publisher
 // (dora_to_ros2) offers BEST_EFFORT; a RELIABLE subscription is incompatible
@@ -254,7 +277,19 @@ public:
       kLeftControllerStateTopic, qos);
     right_state_pub_ = create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
       kRightControllerStateTopic, qos);
+    left_hand_state_pub_ = create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
+      kLeftHandStateTopic, qos);
+    right_hand_state_pub_ = create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
+      kRightHandStateTopic, qos);
+    image_pub_ = create_publisher<sensor_msgs::msg::CompressedImage>(
+      kHeadCameraTopic, rclcpp::QoS(kImageQueueDepth).reliable());
 
+    RCLCPP_INFO(
+      get_logger(), "registered publishers for '%s' and '%s' (depth %zu, reliable)",
+      kLeftHandStateTopic, kRightHandStateTopic, kStateQueueDepth);
+    RCLCPP_INFO(
+      get_logger(), "republishing camera frames from %s on '%s' (depth %zu, reliable)",
+      server_text_.c_str(), kHeadCameraTopic, kImageQueueDepth);
     RCLCPP_INFO(
       get_logger(), "forwarding '%s' and '%s' to %s",
       kLeftArmCommandTopic, kRightArmCommandTopic, server_text_.c_str());
@@ -398,7 +433,7 @@ private:
   /// block instead of poll, and so nothing else has to wait on it.
   void run_receive_loop()
   {
-    unsigned char buffer[transrecv_udp::kReceiveBufferBytes];
+    unsigned char buffer[kRecvBufferBytes];
 
     while (receive_running_.load(std::memory_order_relaxed)) {
       if (!socket_.valid()) {                                // Rule 3: socket sanity
@@ -431,10 +466,22 @@ private:
 
   void handle_datagram(const unsigned char * data, std::size_t length)
   {
-    // Classify by length first: the two packet types have different fixed
-    // sizes, so nothing has to be decoded to tell them apart.
+    // Image chunks first, by magic: their size varies and could match one of
+    // the fixed packet sizes below (see image_protocol.hpp).
+    if (transrecv_udp::is_image_chunk(data, length)) {
+      handle_image_chunk(data, length);
+      return;
+    }
+
+    // Everything else is classified by length: each packet type has its own
+    // fixed size, so nothing has to be decoded to tell them apart.
     if (length == sizeof(transrecv_udp::JointPacket)) {
       handle_joint_datagram(data, length);
+      return;
+    }
+
+    if (length == sizeof(transrecv_udp::HandJointPacket)) {
+      handle_hand_state_datagram(data, length);
       return;
     }
 
@@ -1077,7 +1124,184 @@ private:
       positions[3], positions[4], positions[5], positions[6]);
   }
 
+  /// Decodes a hand state pushed by the server. Same HandJointPacket the client
+  /// sends hand commands in; arriving here, it can only be state.
+  void handle_hand_state_datagram(const unsigned char * data, std::size_t length)
+  {
+    ArmSide side = ArmSide::kLeft;
+    std::vector<double> positions;
+    std::string reason;
+    if (!transrecv_udp::decode_hand_packet(data, length, side, positions, reason)) {
+      RCLCPP_WARN_THROTTLE(                                  // Rule 2: reject, don't guess
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "malformed hand state datagram dropped: %s", reason.c_str());
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    hand_states_received_.fetch_add(1, std::memory_order_relaxed);
+    publish_hand_state(side, positions);
+  }
+
+  /// Publishes one hand's controller state locally.
+  void publish_hand_state(ArmSide side, const std::vector<double> & positions)
+  {
+    if (positions.size() != kNumHandJoints) {                // Rule 3: size guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s hand] %zu positions, expected %zu, not publishing state",
+        transrecv_udp::to_string(side), positions.size(), kNumHandJoints);
+      return;
+    }
+
+    const auto & publisher =
+      side == ArmSide::kLeft ? left_hand_state_pub_ : right_hand_state_pub_;
+    if (publisher == nullptr) {                              // Rule 3: null guard
+      RCLCPP_ERROR(
+        get_logger(), "[%s hand] state publisher is null, not publishing",
+        transrecv_udp::to_string(side));
+      return;
+    }
+
+    control_msgs::msg::JointTrajectoryControllerState message;
+    message.header.stamp = now();
+    message.joint_names = transrecv_udp::hand_joint_names(side);
+    message.feedback.positions = positions;
+    publisher->publish(message);
+
+    hand_states_published_.fetch_add(1, std::memory_order_relaxed);
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kLogThrottleMs,
+      "[%s hand] state published: [%.3f %.3f %.3f %.3f %.3f %.3f]",
+      transrecv_udp::to_string(side), positions[0], positions[1], positions[2],
+      positions[3], positions[4], positions[5]);
+  }
+
+  // --- head camera -----------------------------------------------------------
+
+  /// Feeds one chunk to the reassembler and publishes the frame it completes.
+  /// Runs on the receive thread, the only user of image_reassembler_.
+  void handle_image_chunk(const unsigned char * data, std::size_t length)
+  {
+    transrecv_udp::ImageChunkHeader header{};
+    const std::uint8_t * payload = nullptr;
+    std::size_t payload_bytes = 0;
+    std::string reason;
+    if (!transrecv_udp::decode_image_chunk(data, length, header, payload, payload_bytes, reason)) {
+      RCLCPP_WARN_THROTTLE(                                  // Rule 2: reject, don't guess
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[image] malformed chunk dropped: %s", reason.c_str());
+      packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    const std::uint64_t abandoned_before = image_reassembler_.frames_abandoned();
+    const transrecv_udp::ImageReassembler::Result result =
+      image_reassembler_.add(header, payload, payload_bytes);
+
+    if (image_reassembler_.frames_abandoned() != abandoned_before) {   // Rule 2: lost chunks
+      // Mirrored into an atomic: the reassembler is receive-thread only, the
+      // health thread reads this copy.
+      images_incomplete_.store(
+        image_reassembler_.frames_abandoned(), std::memory_order_relaxed);
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[image] frame before %u never completed (chunks lost), %lu incomplete so far",
+        header.frame_seq,
+        static_cast<unsigned long>(image_reassembler_.frames_abandoned()));
+    }
+
+    switch (result) {
+      case transrecv_udp::ImageReassembler::Result::kPending:
+        return;
+      case transrecv_udp::ImageReassembler::Result::kStale:
+        RCLCPP_DEBUG(
+          get_logger(), "[image] late chunk of frame %u ignored", header.frame_seq);
+        return;
+      case transrecv_udp::ImageReassembler::Result::kDuplicate:
+        RCLCPP_DEBUG(
+          get_logger(), "[image] duplicate chunk %u of frame %u ignored",
+          static_cast<unsigned>(header.chunk_index), header.frame_seq);
+        return;
+      case transrecv_udp::ImageReassembler::Result::kInconsistent:
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), kLogThrottleMs,
+          "[image] chunk %u of frame %u disagrees with the frame in progress, ignored",
+          static_cast<unsigned>(header.chunk_index), header.frame_seq);
+        packets_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+      case transrecv_udp::ImageReassembler::Result::kComplete:
+        break;
+    }
+
+    transrecv_udp::ImageFrame frame;
+    if (!transrecv_udp::decode_image_frame(image_reassembler_.frame(), frame, reason)) {
+      RCLCPP_WARN_THROTTLE(                                  // Rule 2: reject, don't guess
+        get_logger(), *get_clock(), kLogThrottleMs,
+        "[image] frame %u reassembled but undecodable: %s", header.frame_seq, reason.c_str());
+      images_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    publish_image(header.frame_seq, std::move(frame));
+  }
+
+  void publish_image(std::uint32_t seq, transrecv_udp::ImageFrame frame)
+  {
+    if (image_pub_ == nullptr) {                             // Rule 3: null guard
+      RCLCPP_ERROR(get_logger(), "[image] publisher is null, dropping frame %u", seq);
+      images_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    sensor_msgs::msg::CompressedImage message;
+    // The camera's own capture stamp, not the time it got here: it is what
+    // lines a frame up with the moment it shows. The two machines' clocks are
+    // not synchronised, so compare it with server-side stamps, not local ones.
+    message.header.stamp.sec = frame.stamp_sec;
+    message.header.stamp.nanosec = frame.stamp_nanosec;
+    message.header.frame_id = std::move(frame.frame_id);
+    message.format = std::move(frame.format);
+    message.data = std::move(frame.data);
+
+    const std::size_t bytes = message.data.size();
+    image_pub_->publish(std::move(message));
+    images_published_.fetch_add(1, std::memory_order_relaxed);
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), kLogThrottleMs,
+      "[image] frame %u published: %zu bytes", seq, bytes);
+  }
+
   // --- health thread ---------------------------------------------------------
+
+  /// Hand-state and image half of the health report, printed whatever state
+  /// the link is in.
+  void report_hand_and_image_health()
+  {
+    RCLCPP_INFO(
+      get_logger(), "health: hand state received=%lu published=%lu",
+      static_cast<unsigned long>(hand_states_received_.load(std::memory_order_relaxed)),
+      static_cast<unsigned long>(hand_states_published_.load(std::memory_order_relaxed)));
+
+    const std::uint64_t published = images_published_.load(std::memory_order_relaxed);
+    const std::uint64_t incomplete = images_incomplete_.load(std::memory_order_relaxed);
+    const std::uint64_t dropped = images_dropped_.load(std::memory_order_relaxed);
+
+    if (published == 0) {                                    // Rule 2: nothing yet
+      RCLCPP_WARN(
+        get_logger(),
+        "health: no camera frame rebuilt yet for '%s' | incomplete=%lu undecodable=%lu",
+        kHeadCameraTopic, static_cast<unsigned long>(incomplete),
+        static_cast<unsigned long>(dropped));
+      return;
+    }
+
+    RCLCPP_INFO(
+      get_logger(), "health: image published=%lu incomplete=%lu undecodable=%lu",
+      static_cast<unsigned long>(published), static_cast<unsigned long>(incomplete),
+      static_cast<unsigned long>(dropped));
+  }
 
   /// One watchdog pass, on its own thread so a stalled callback is still
   /// reported by something that did not stall.
@@ -1087,6 +1311,8 @@ private:
       RCLCPP_ERROR(get_logger(), "health: socket is not open, client is dead");
       return;
     }
+
+    report_hand_and_image_health();
 
     const std::uint64_t sent = packets_sent_.load(std::memory_order_relaxed);
     const std::uint64_t dropped = packets_dropped_.load(std::memory_order_relaxed);
@@ -1224,6 +1450,21 @@ private:
     left_state_pub_;
   rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
     right_state_pub_;
+  rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
+    left_hand_state_pub_;
+  rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
+    right_hand_state_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr image_pub_;
+
+  // Written by the receive thread, read by the health thread.
+  std::atomic<std::uint64_t> hand_states_received_{0};
+  std::atomic<std::uint64_t> hand_states_published_{0};
+  std::atomic<std::uint64_t> images_published_{0};
+  std::atomic<std::uint64_t> images_incomplete_{0};
+  std::atomic<std::uint64_t> images_dropped_{0};
+
+  // Touched only by the receive thread.
+  transrecv_udp::ImageReassembler image_reassembler_;
 
   std::thread receive_thread_;
   std::atomic<bool> receive_running_{false};
@@ -1302,6 +1543,12 @@ int main(int argc, char ** argv)
     RCLCPP_ERROR(logger, "cannot set the receive timeout, exiting");
     rclcpp::shutdown();
     return 1;
+  }
+
+  // Not fatal: with the default buffer joint data still flows fine, camera
+  // frames just lose chunks more often. set_receive_buffer() says which.
+  if (!client_socket.set_receive_buffer(kSocketReceiveBufferBytes, logger)) {
+    RCLCPP_WARN(logger, "keeping the default receive buffer, camera frames may drop");
   }
 
   const std::string server_text = server_ip + ":" + std::to_string(server_port.value());
